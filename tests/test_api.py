@@ -115,6 +115,30 @@ def test_update_task(client: TestClient) -> None:
     assert client.get(f"/tasks/{task_id}").json() == response.json()
 
 
+def test_task_update_survives_application_instances(
+    test_database_url: str,
+    clean_tasks: None,
+) -> None:
+    replacement = {"title": "Publish tutorial", "completed": True}
+    with TestClient(create_app(test_database_url)) as first_client:
+        created = first_client.post("/tasks", json={"title": "Write tutorial"})
+
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    with TestClient(create_app(test_database_url)) as second_client:
+        response = second_client.put(f"/tasks/{task_id}", json=replacement)
+
+    assert response.status_code == 200, response.json()
+    assert response.json() == {"id": task_id, **replacement}
+
+    with TestClient(create_app(test_database_url)) as third_client:
+        persisted = third_client.get(f"/tasks/{task_id}")
+
+    assert persisted.status_code == 200
+    assert persisted.json() == response.json()
+
+
 def test_delete_task(client: TestClient) -> None:
     created = client.post("/tasks", json={"title": "Write tutorial"})
     task_id = created.json()["id"]
