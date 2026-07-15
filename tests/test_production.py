@@ -516,6 +516,24 @@ def test_production_workload_contract() -> None:
     assert '"key": "logging.json"' in harness
     assert '"path": "logging.json"' in harness
 
+    port_forward_start = harness.index("start_application_port_forward() {")
+    port_forward_end = harness.index("\nhttp_request() {", port_forward_start)
+    port_forward_block = harness[port_forward_start:port_forward_end]
+    assert "  stop_application_port_forward\n" in port_forward_block
+
+    release_start = harness.index("verify_release_state() {")
+    release_end = harness.index("\nrun_production_sequence() {", release_start)
+    release_block = harness[release_start:release_end]
+    assert (
+        "  start_application_port_forward\n"
+        "  verify_http_state \"$sequence\" \"$state\""
+    ) in release_block
+
+    sequence_start = harness.index("run_production_sequence() {")
+    sequence_end = harness.index("\nverify_evidence_semantics() {", sequence_start)
+    sequence_block = harness[sequence_start:sequence_end]
+    assert "start_application_port_forward" not in sequence_block
+
     assert 'ANON_DOCKER_CONFIG="$(mktemp -d)"' in harness
     assert 'chmod 700 "$ANON_DOCKER_CONFIG"' in harness
     for variable in (
