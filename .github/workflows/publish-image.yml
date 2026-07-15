@@ -285,7 +285,7 @@ jobs:
           else
             EXPECTED_DIGEST="$EXISTING_DIGEST"
           fi
-          test "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$
+          [[ "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
 
           ANON_DOCKER_CONFIG="$(mktemp -d)"
           chmod 700 "$ANON_DOCKER_CONFIG"
@@ -332,7 +332,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "image_digest=$IMAGE_DIGEST" >>"$GITHUB_OUTPUT"
           echo "target_sha=$TARGET_SHA image_digest=$IMAGE_DIGEST"
           echo "target_sha=$TARGET_SHA image_digest=$IMAGE_DIGEST" \

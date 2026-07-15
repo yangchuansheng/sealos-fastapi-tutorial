@@ -137,6 +137,10 @@ def test_publisher_uses_one_validated_source_identity() -> None:
     )
     assert workflow.count('ANON_DOCKER_CONFIG="$(mktemp -d)"') == 2
     assert 'test "$PUBLISHED_DIGEST" = "$CANDIDATE_DIGEST"' not in workflow
+    assert '[[ "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]' in workflow
+    assert '[[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]' in workflow
+    assert 'test "$EXPECTED_DIGEST" =~' not in workflow
+    assert 'test "$IMAGE_DIGEST" =~' not in workflow
     assert "type=ref" not in workflow
     assert "latest=true" not in workflow
     assert ":latest" not in workflow
