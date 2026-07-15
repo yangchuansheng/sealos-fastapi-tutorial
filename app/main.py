@@ -1,12 +1,17 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-__all__ = ["Task", "TaskCreate", "app", "create_app"]
+__all__ = ["Task", "TaskCreate", "TaskUpdate", "app", "create_app"]
 
 
 class TaskCreate(BaseModel):
     title: str
     completed: bool = False
+
+
+class TaskUpdate(BaseModel):
+    title: str
+    completed: bool
 
 
 class Task(BaseModel):
@@ -42,6 +47,15 @@ def create_app() -> FastAPI:
         if task_id not in tasks:
             raise HTTPException(status_code=404)
         return tasks[task_id]
+
+    @application.put("/tasks/{task_id}", response_model=Task)
+    def update_task(task_id: int, payload: TaskUpdate) -> Task:
+        if task_id not in tasks:
+            raise HTTPException(status_code=404)
+
+        task = Task(id=task_id, **payload.model_dump())
+        tasks[task_id] = task
+        return task
 
     return application
 
