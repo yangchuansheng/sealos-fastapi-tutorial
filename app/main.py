@@ -99,12 +99,24 @@ def create_app(database_url: str | None = None) -> FastAPI:
         )
 
     @application.put("/tasks/{task_id}", response_model=Task)
-    def update_task(task_id: int, payload: TaskUpdate) -> Task:
-        get_task_or_404(task_id)
+    def update_task(
+        task_id: int,
+        payload: TaskUpdate,
+        session: Session = Depends(runtime.get_session),
+    ) -> Task:
+        record = session.get(TaskRecord, task_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found")
 
-        task = Task(id=task_id, **payload.model_dump())
-        tasks[task_id] = task
-        return task
+        record.title = payload.title
+        record.completed = payload.completed
+        session.commit()
+        session.refresh(record)
+        return Task(
+            id=record.id,
+            title=record.title,
+            completed=record.completed,
+        )
 
     @application.delete("/tasks/{task_id}", status_code=204)
     def delete_task(task_id: int) -> Response:
