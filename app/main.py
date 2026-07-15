@@ -1,3 +1,4 @@
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -10,6 +11,8 @@ from app.database import DatabaseRuntime
 from app.models import TaskRecord
 
 __all__ = ["Task", "TaskCreate", "TaskUpdate", "app", "create_app"]
+
+logger = logging.getLogger(__name__)
 
 
 class TaskCreate(BaseModel):
@@ -46,6 +49,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @application.get("/health")
     def health() -> dict[str, str]:
+        readiness_issue = runtime.readiness_issue()
+        if readiness_issue is not None:
+            logger.warning("Database readiness failed: %s", readiness_issue)
+            raise HTTPException(
+                status_code=503,
+                detail="Database is not ready",
+            )
         return {"status": "ok"}
 
     @application.post("/tasks", response_model=Task, status_code=201)
