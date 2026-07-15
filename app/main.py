@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 __all__ = ["Task", "TaskCreate", "app", "create_app"]
@@ -36,6 +36,12 @@ def create_app() -> FastAPI:
     @application.get("/tasks", response_model=list[Task])
     def list_tasks() -> list[Task]:
         return [tasks[task_id] for task_id in sorted(tasks)]
+
+    @application.get("/tasks/{task_id}", response_model=Task)
+    def get_task(task_id: int) -> Task:
+        if task_id not in tasks:
+            raise HTTPException(status_code=404)
+        return tasks[task_id]
 
     return application
 
