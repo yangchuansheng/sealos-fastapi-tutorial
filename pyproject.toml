@@ -1,0 +1,20 @@
+[project]
+name = "sealos-fastapi-tutorial"
+version = "0.1.0"
+description = "Tasks API reference application for the Sealos FastAPI tutorial series"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.139.0",
+  "pydantic==2.13.4",
+  "uvicorn==0.51.0",
+]
+
+[dependency-groups]
+dev = [
+  "httpx==0.28.1",
+  "pytest==9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
