@@ -10,21 +10,31 @@ EXPECTED_MANIFEST = dedent(
     apiVersion: batch/v1
     kind: Job
     metadata:
-      name: sealos-fastapi-migration
+      name: __JOB_NAME__
       labels:
-        app.kubernetes.io/name: sealos-fastapi-migration
+        app.kubernetes.io/name: __JOB_NAME__
+        tutorial.sealos.io/run-id: __RUN_ID__
     spec:
       backoffLimit: 1
       activeDeadlineSeconds: 300
       template:
         metadata:
           labels:
-            app.kubernetes.io/name: sealos-fastapi-migration
+            app.kubernetes.io/name: __JOB_NAME__
+            tutorial.sealos.io/run-id: __RUN_ID__
         spec:
+          automountServiceAccountToken: false
           restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
           containers:
             - name: migrate
-              image: ghcr.io/yangchuansheng/sealos-fastapi-tutorial:stage-2-postgresql
+              image: __IMAGE_REFERENCE__
+              imagePullPolicy: IfNotPresent
               workingDir: /app
               command:
                 - alembic
@@ -34,8 +44,32 @@ EXPECTED_MANIFEST = dedent(
                 - name: DATABASE_URL
                   valueFrom:
                     secretKeyRef:
-                      name: sealos-fastapi-postgresql
+                      name: __SECRET_NAME__
                       key: url
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 10001
+                runAsGroup: 10001
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Mi
     """
 )
 

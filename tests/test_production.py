@@ -1,6 +1,7 @@
 import logging
 import re
 from pathlib import Path
+from textwrap import dedent
 
 from fastapi.testclient import TestClient
 
@@ -11,6 +12,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE_PATH = PROJECT_ROOT / "Dockerfile"
 DOCKERIGNORE_PATH = PROJECT_ROOT / ".dockerignore"
 WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "publish-image.yml"
+APPLICATION_MANIFEST_PATH = PROJECT_ROOT / "deploy" / "application.yaml"
+PRODUCTION_HARNESS_PATH = PROJECT_ROOT / "scripts" / "test-production.sh"
 
 PYTHON_IMAGE = (
     "python:3.12.13-slim-bookworm@"
@@ -50,6 +53,114 @@ APPROVED_ACTIONS = {
         "53b7df96c91f9c12dcc8a07bcb9ccacbed38856a",
     ),
 }
+
+EXPECTED_APPLICATION_MANIFEST = dedent(
+    """\
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: __APP_NAME__
+      labels:
+        app.kubernetes.io/name: __APP_NAME__
+        tutorial.sealos.io/run-id: __RUN_ID__
+    spec:
+      replicas: 2
+      revisionHistoryLimit: 3
+      progressDeadlineSeconds: 180
+      strategy:
+        type: RollingUpdate
+        rollingUpdate:
+          maxUnavailable: 0
+          maxSurge: 1
+      selector:
+        matchLabels:
+          app.kubernetes.io/name: __APP_NAME__
+          tutorial.sealos.io/run-id: __RUN_ID__
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: __APP_NAME__
+            tutorial.sealos.io/run-id: __RUN_ID__
+        spec:
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: app
+              image: __IMAGE_REFERENCE__
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: __SECRET_NAME__
+                      key: url
+                - name: SOURCE_RELEASE
+                  value: "__SOURCE_RELEASE__"
+                - name: IMAGE_REFERENCE
+                  value: "__IMAGE_REFERENCE__"
+              ports:
+                - name: http
+                  containerPort: 8000
+                  protocol: TCP
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: http
+                  scheme: HTTP
+                initialDelaySeconds: 2
+                periodSeconds: 5
+                timeoutSeconds: 2
+                failureThreshold: 12
+                successThreshold: 1
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 10001
+                runAsGroup: 10001
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                medium: Memory
+                sizeLimit: 64Mi
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: __APP_NAME__
+      labels:
+        app.kubernetes.io/name: __APP_NAME__
+        tutorial.sealos.io/run-id: __RUN_ID__
+    spec:
+      type: ClusterIP
+      selector:
+        app.kubernetes.io/name: __APP_NAME__
+        tutorial.sealos.io/run-id: __RUN_ID__
+      ports:
+        - name: http
+          port: 8000
+          targetPort: http
+          protocol: TCP
+    """
+)
 
 
 def test_hardened_container_contract() -> None:
@@ -168,3 +279,99 @@ def test_startup_log_identifies_release(monkeypatch, caplog) -> None:
         f"source_release={source_release} "
         f"image_reference={image_reference}"
     ]
+
+
+def test_production_workload_contract() -> None:
+    assert (
+        APPLICATION_MANIFEST_PATH.is_file()
+    ), "deploy/application.yaml must exist"
+    assert PRODUCTION_HARNESS_PATH.is_file(), "production harness must exist"
+
+    assert APPLICATION_MANIFEST_PATH.read_text() == EXPECTED_APPLICATION_MANIFEST
+    harness = PRODUCTION_HARNESS_PATH.read_text()
+
+    assert harness.startswith("#!/usr/bin/env bash\nset -euo pipefail\n")
+    for argument in (
+        "--baseline-image",
+        "--baseline-source",
+        "--final-image",
+        "--final-source",
+        "--evidence-dir",
+    ):
+        assert argument in harness
+    for mode in (
+        "--run",
+        "--preflight-evidence",
+        "--verify-evidence",
+        "--help",
+    ):
+        assert mode in harness
+
+    assert "^[0-9a-f]{40}$" in harness
+    assert "@sha256:[0-9a-f]{64}$" in harness
+    assert "test-postgres.sh --session-start --state-file" in harness
+    assert "test-postgres.sh --session-stop --state-file" in harness
+    assert "test-postgres.sh --assert-clean --state-file" in harness
+    assert "apply --dry-run=server --validate=strict" in harness
+    assert "kubectl rollout undo" in harness
+    assert "trap cleanup EXIT INT TERM HUP" in harness
+    assert harness.index("trap cleanup EXIT INT TERM HUP") < harness.index(
+        "start_database_session"
+    )
+
+    for token in (
+        "__RUN_ID__",
+        "__APP_NAME__",
+        "__IMAGE_REFERENCE__",
+        "__SOURCE_RELEASE__",
+        "__SECRET_NAME__",
+        "__JOB_NAME__",
+    ):
+        assert token in harness
+    assert "__[A-Z0-9_]+__" in harness
+
+    for resource in (
+        "deployment",
+        "replicaset",
+        "pod",
+        "service",
+        "job",
+        "secret",
+        "configmap",
+    ):
+        assert resource in harness.lower()
+    for filename in (
+        "workflow.txt",
+        "images.txt",
+        "migration.txt",
+        "runtime.txt",
+        "logs.txt",
+        "http.jsonl",
+        "rollback.txt",
+        "cleanup.txt",
+        "publication.txt",
+        "checksums.txt",
+    ):
+        assert filename in harness
+
+    assert "verify_live_evidence" in harness
+    assert "preflight_publication_evidence" in harness
+    assert "verify_publication_evidence" in harness
+    assert "expected_checksum_count=8" in harness
+    assert "expected_checksum_count=9" in harness
+    assert "kubectl rollout undo" in harness
+    assert "baseline-rollback" in harness
+    assert "final-recovered" in harness
+
+    assert 'ANON_DOCKER_CONFIG="$(mktemp -d)"' in harness
+    assert 'chmod 700 "$ANON_DOCKER_CONFIG"' in harness
+    for variable in (
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GHCR_TOKEN",
+        "REGISTRY_TOKEN",
+        "DOCKER_AUTH_CONFIG",
+        "REGISTRY_AUTH_FILE",
+        "CRANE_AUTH",
+    ):
+        assert f"-u {variable}" in harness
