@@ -601,6 +601,21 @@ print("SQLALCHEMY_READY select=1")
 PY
 }
 
+run_redacted_pytest() (
+  local pytest_log
+  local pytest_status
+
+  pytest_log="$(mktemp "/tmp/sealos-fastapi-pytest-${RUN_ID}.XXXXXX.log")"
+  trap 'rm -f "$pytest_log"' EXIT INT TERM HUP
+  set +e
+  DATABASE_URL="$DATABASE_URL" TEST_DATABASE_URL="$TEST_DATABASE_URL" \
+    uv run pytest "$@" >"$pytest_log" 2>&1
+  pytest_status=$?
+  set -e
+  sed -E 's#postgresql(\+psycopg)?://[^@[:space:]]+@#postgresql+psycopg://REDACTED@#g' "$pytest_log"
+  exit "$pytest_status"
+)
+
 run_migrations() {
   DATABASE_URL="$DATABASE_URL" uv run alembic upgrade head
   DATABASE_URL="$DATABASE_URL" uv run alembic upgrade head
@@ -737,18 +752,9 @@ run_source_job() (
 )
 
 run_migrated_health() {
-  local health_log
-  local health_status
-
-  health_log="$(mktemp "/tmp/sealos-fastapi-health-${RUN_ID}.XXXXXX.log")"
-  set +e
-  DATABASE_URL="$DATABASE_URL" TEST_DATABASE_URL="$TEST_DATABASE_URL" uv run pytest \
-    tests/test_health.py::test_health_accepts_migrated_database -q -x >"$health_log" 2>&1
-  health_status=$?
-  set -e
-  sed -E 's#postgresql(\+psycopg)?://[^@[:space:]]+@#postgresql+psycopg://REDACTED@#g' "$health_log"
-  rm -f "$health_log"
-  [[ "$health_status" == 0 ]] || fail "migrated public health check failed"
+  run_redacted_pytest \
+    tests/test_health.py::test_health_accepts_migrated_database -q -x || \
+    fail "migrated public health check failed"
 }
 
 run_jobs() {
@@ -787,7 +793,7 @@ dispatch_attached_mode() {
   check_database_connection
   case "$MODE" in
     pytest-only)
-      DATABASE_URL="$DATABASE_URL" TEST_DATABASE_URL="$TEST_DATABASE_URL" uv run pytest "${PASSTHROUGH_ARGS[@]}"
+      run_redacted_pytest "${PASSTHROUGH_ARGS[@]}"
       ;;
     migrations-only)
       run_migrations
@@ -796,10 +802,10 @@ dispatch_attached_mode() {
       run_jobs
       ;;
     phase-gate)
-      DATABASE_URL="$DATABASE_URL" TEST_DATABASE_URL="$TEST_DATABASE_URL" uv run pytest \
+      run_redacted_pytest \
         tests/test_health.py::test_health_waits_for_migrated_schema -q -x
       run_migrations
-      DATABASE_URL="$DATABASE_URL" TEST_DATABASE_URL="$TEST_DATABASE_URL" uv run pytest -q
+      run_redacted_pytest -q
       run_jobs
       run_reproducibility_checks
       ;;
