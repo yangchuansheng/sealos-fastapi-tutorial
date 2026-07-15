@@ -665,6 +665,7 @@ assert template["volumes"] == [
     {
         "name": "logging",
         "configMap": {
+            "defaultMode": 420,
             "name": app_name,
             "items": [{"key": "logging.json", "path": "logging.json"}],
         },
