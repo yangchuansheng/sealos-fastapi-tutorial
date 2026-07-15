@@ -180,6 +180,20 @@ def test_reject_invalid_task(client: TestClient, title: str) -> None:
     assert response.status_code == 422
 
 
+@pytest.mark.parametrize("title", ["", "x" * 201])
+def test_reject_invalid_task_update(client: TestClient, title: str) -> None:
+    created = client.post("/tasks", json={"title": "Write tutorial"})
+    task_id = created.json()["id"]
+
+    response = client.put(
+        f"/tasks/{task_id}",
+        json={"title": title, "completed": True},
+    )
+
+    assert response.status_code == 422
+    assert client.get(f"/tasks/{task_id}").json() == created.json()
+
+
 @pytest.mark.parametrize(
     ("method", "payload"),
     [
