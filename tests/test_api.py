@@ -35,6 +35,27 @@ def test_create_task(client: TestClient) -> None:
     }
 
 
+def test_task_survives_application_instances(
+    test_database_url: str,
+    clean_tasks: None,
+) -> None:
+    with TestClient(create_app()) as first_client:
+        created = first_client.post("/tasks", json={"title": "Write tutorial"})
+
+    assert created.status_code == 201
+    assert created.json() == {
+        "id": 1,
+        "title": "Write tutorial",
+        "completed": False,
+    }
+
+    with TestClient(create_app()) as second_client:
+        response = second_client.get(f"/tasks/{created.json()['id']}")
+
+    assert response.status_code == 200, response.json()
+    assert response.json() == created.json()
+
+
 def test_list_tasks(client: TestClient) -> None:
     created = client.post("/tasks", json={"title": "Write tutorial"})
 
