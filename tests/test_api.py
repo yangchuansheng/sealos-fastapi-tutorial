@@ -82,3 +82,24 @@ def test_reject_invalid_task(client: TestClient, title: str) -> None:
     response = client.post("/tasks", json={"title": title})
 
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("method", "payload"),
+    [
+        ("GET", None),
+        ("PUT", {"title": "Unknown task", "completed": False}),
+        ("DELETE", None),
+    ],
+)
+def test_missing_task_returns_404(
+    client: TestClient,
+    method: str,
+    payload: dict[str, object] | None,
+) -> None:
+    request_kwargs = {"json": payload} if payload is not None else {}
+
+    response = client.request(method, "/tasks/999", **request_kwargs)
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Task not found"}
