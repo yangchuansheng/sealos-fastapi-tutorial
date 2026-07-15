@@ -1,2 +1,2 @@
-run_id=290c28e99083 fresh_upgrade=passed revision=0001
-run_id=290c28e99083 repeat_upgrade=passed revision=0001
+run_id=3992abb04fa7 fresh_upgrade=passed revision=0001
+run_id=3992abb04fa7 repeat_upgrade=passed revision=0001
