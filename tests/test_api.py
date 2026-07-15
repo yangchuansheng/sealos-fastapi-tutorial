@@ -33,3 +33,12 @@ def test_create_task(client: TestClient) -> None:
         "title": "Write tutorial",
         "completed": False,
     }
+
+
+def test_list_tasks(client: TestClient) -> None:
+    created = client.post("/tasks", json={"title": "Write tutorial"})
+
+    response = client.get("/tasks")
+
+    assert response.status_code == 200
+    assert response.json() == [created.json()]
