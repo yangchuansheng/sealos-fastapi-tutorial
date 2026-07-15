@@ -203,7 +203,15 @@ jobs:
             existing_digest="$(awk '$1 == "Digest:" {print $2; exit}' \
               <<<"$inspect_output")"
             test -n "$existing_digest"
-            test "$existing_digest" = "$CANDIDATE_DIGEST"
+            existing_image="$(DOCKER_CONFIG="$ANON_DOCKER_CONFIG" \
+              docker buildx imagetools inspect "$IMAGE_TAG" \
+              --format '{{json .Image}}')"
+            jq -e --arg sha "$TARGET_SHA" \
+              '.architecture == "amd64" and .os == "linux" and
+               .config.Labels["org.opencontainers.image.revision"] == $sha and
+               .config.Labels["org.opencontainers.image.source"] ==
+                 "https://github.com/yangchuansheng/sealos-fastapi-tutorial"' \
+              <<<"$existing_image" >/dev/null
             publish_needed=false
           else
             if grep -Eqi 'not found|manifest unknown|name unknown' \
@@ -263,21 +271,67 @@ jobs:
           push: true
           sbom: false
           tags: ${{ steps.metadata.outputs.tags }}
-      - name: Record immutable output
-        id: result
+      - name: Read back public immutable image
+        id: readback
         env:
-          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          EXISTING_DIGEST: ${{ steps.tag.outputs.existing_digest }}
           PUBLISHED_DIGEST: ${{ steps.publish.outputs.digest }}
           PUBLISH_NEEDED: ${{ steps.tag.outputs.publish_needed }}
         shell: bash
         run: |
           set -euo pipefail
           if [[ "$PUBLISH_NEEDED" == "true" ]]; then
-            test "$PUBLISHED_DIGEST" = "$CANDIDATE_DIGEST"
-            IMAGE_DIGEST="$PUBLISHED_DIGEST"
+            EXPECTED_DIGEST="$PUBLISHED_DIGEST"
           else
-            IMAGE_DIGEST="$CANDIDATE_DIGEST"
+            EXPECTED_DIGEST="$EXISTING_DIGEST"
           fi
+          test "$EXPECTED_DIGEST" =~ ^sha256:[0-9a-f]{64}$
+
+          ANON_DOCKER_CONFIG="$(mktemp -d)"
+          chmod 700 "$ANON_DOCKER_CONFIG"
+          test -z "$(find "$ANON_DOCKER_CONFIG" -mindepth 1 -print -quit)"
+          cleanup() {
+            rm -rf "$ANON_DOCKER_CONFIG"
+          }
+          trap cleanup EXIT
+
+          readback_digest=""
+          for attempt in $(seq 1 12); do
+            set +e
+            inspect_output="$(DOCKER_CONFIG="$ANON_DOCKER_CONFIG" \
+              docker buildx imagetools inspect "$IMAGE_TAG" 2>&1)"
+            inspect_status=$?
+            set -e
+            if [[ "$inspect_status" -eq 0 ]]; then
+              readback_digest="$(awk '$1 == "Digest:" {print $2; exit}' \
+                <<<"$inspect_output")"
+              test "$readback_digest" = "$EXPECTED_DIGEST"
+              break
+            fi
+            sleep 5
+          done
+          test "$readback_digest" = "$EXPECTED_DIGEST"
+
+          image_json="$(DOCKER_CONFIG="$ANON_DOCKER_CONFIG" \
+            docker buildx imagetools inspect "$IMAGE_TAG" \
+            --format '{{json .Image}}')"
+          jq -e --arg sha "$TARGET_SHA" \
+            '.architecture == "amd64" and .os == "linux" and
+             .config.Labels["org.opencontainers.image.revision"] == $sha and
+             .config.Labels["org.opencontainers.image.source"] ==
+               "https://github.com/yangchuansheng/sealos-fastapi-tutorial"' \
+            <<<"$image_json" >/dev/null
+
+          echo "image_digest=$readback_digest" >>"$GITHUB_OUTPUT"
+          cleanup
+          trap - EXIT
+      - name: Record immutable output
+        id: result
+        env:
+          IMAGE_DIGEST: ${{ steps.readback.outputs.image_digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
           test "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$
           echo "image_digest=$IMAGE_DIGEST" >>"$GITHUB_OUTPUT"
           echo "target_sha=$TARGET_SHA image_digest=$IMAGE_DIGEST"

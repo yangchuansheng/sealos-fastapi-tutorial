@@ -129,6 +129,14 @@ def test_publisher_uses_one_validated_source_identity() -> None:
     assert "package_status" in workflow
     assert "candidate_digest" in workflow
     assert "publish_needed" in workflow
+    assert "--format '{{json .Image}}'" in workflow
+    assert '.config.Labels["org.opencontainers.image.revision"]' in workflow
+    assert "steps.readback.outputs.image_digest" in workflow
+    assert (
+        "IMAGE_DIGEST: ${{ steps.readback.outputs.image_digest }}" in workflow
+    )
+    assert workflow.count('ANON_DOCKER_CONFIG="$(mktemp -d)"') == 2
+    assert 'test "$PUBLISHED_DIGEST" = "$CANDIDATE_DIGEST"' not in workflow
     assert "type=ref" not in workflow
     assert "latest=true" not in workflow
     assert ":latest" not in workflow
