@@ -52,3 +52,15 @@ def test_get_task(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == created.json()
+
+
+def test_update_task(client: TestClient) -> None:
+    created = client.post("/tasks", json={"title": "Write tutorial"})
+    task_id = created.json()["id"]
+    replacement = {"title": "Publish tutorial", "completed": True}
+
+    response = client.put(f"/tasks/{task_id}", json=replacement)
+
+    assert response.status_code == 200
+    assert response.json() == {"id": task_id, **replacement}
+    assert client.get(f"/tasks/{task_id}").json() == response.json()
