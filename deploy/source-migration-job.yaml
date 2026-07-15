@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: __JOB_NAME__
+  labels:
+    tutorial.sealos.io/run-id: __RUN_ID__
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        tutorial.sealos.io/run-id: __RUN_ID__
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: python:3.12.13-slim-bookworm
+          workingDir: /app
+          command:
+            - /bin/sh
+            - -ec
+          args:
+            - |
+              python -m venv /tmp/runtime
+              /tmp/runtime/bin/pip install --disable-pip-version-check --no-cache-dir --requirement /app/requirements.txt
+              export PATH="/tmp/runtime/bin:${PATH}"
+              alembic upgrade head
+              alembic current
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: __SECRET_NAME__
+                  key: url
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: 250m
+              memory: 512Mi
+          volumeMounts:
+            - name: source
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: source
+          configMap:
+            name: __CONFIGMAP_NAME__
+            items:
+              - key: app-models.py
+                path: app/models.py
+              - key: alembic.ini
+                path: alembic.ini
+              - key: migration-env.py
+                path: migrations/env.py
+              - key: migration-script.py.mako
+                path: migrations/script.py.mako
+              - key: migration-0001.py
+                path: migrations/versions/0001_create_tasks.py
+              - key: requirements.txt
+                path: requirements.txt

@@ -9,6 +9,7 @@ POSTGRES_IMAGE="postgres:17.10-bookworm@sha256:4f736ae292687621d4dbe0d499ffd024a
 POSTGRES_USER="tasks"
 POSTGRES_DB="tasks"
 WAIT_SECONDS=120
+JOB_WAIT_SECONDS=300
 
 MODE="phase-gate"
 STATE_FILE=""
@@ -18,6 +19,7 @@ RUN_LABEL=""
 SECRET_NAME=""
 DEPLOYMENT_NAME=""
 SERVICE_NAME=""
+SOURCE_CONFIGMAP_NAME=""
 DATABASE_URL=""
 TEST_DATABASE_URL=""
 SUPERVISOR_PID=""
@@ -100,6 +102,7 @@ set_run_identity() {
   SECRET_NAME="${RESOURCE_PREFIX}-${RUN_ID}-secret"
   DEPLOYMENT_NAME="${RESOURCE_PREFIX}-${RUN_ID}-db"
   SERVICE_NAME="${RESOURCE_PREFIX}-${RUN_ID}-service"
+  SOURCE_CONFIGMAP_NAME="${RESOURCE_PREFIX}-${RUN_ID}-source"
   PORT_FORWARD_LOG="/tmp/sealos-fastapi-postgres-${RUN_ID}-port-forward.log"
   SUPERVISOR_LOG="/tmp/sealos-fastapi-postgres-${RUN_ID}-supervisor.log"
 }
@@ -153,12 +156,13 @@ assert_inventory_names_match_run() {
 }
 
 apply_secret() {
-  POSTGRES_PASSWORD="$POSTGRES_PASSWORD" python - "$SECRET_NAME" "$RUN_ID" "$RUN_LABEL_KEY" <<'PY' | kubectl --namespace "$NAMESPACE" apply -f - >/dev/null
+  POSTGRES_PASSWORD="$POSTGRES_PASSWORD" python - "$SECRET_NAME" "$RUN_ID" "$RUN_LABEL_KEY" "$SERVICE_NAME" <<'PY' | kubectl --namespace "$NAMESPACE" apply -f - >/dev/null
 import json
 import os
 import sys
 
-name, run_id, label_key = sys.argv[1:]
+name, run_id, label_key, service_name = sys.argv[1:]
+password = os.environ["POSTGRES_PASSWORD"]
 document = {
     "apiVersion": "v1",
     "kind": "Secret",
@@ -166,8 +170,12 @@ document = {
     "type": "Opaque",
     "stringData": {
         "username": "tasks",
-        "password": os.environ["POSTGRES_PASSWORD"],
+        "password": password,
         "database": "tasks",
+        "url": (
+            f"postgresql+psycopg://tasks:{password}@"
+            f"{service_name}:5432/tasks"
+        ),
     },
 }
 print(json.dumps(document))
@@ -322,6 +330,68 @@ PY
   fail "port-forward did not become ready after three bounded attempts"
 }
 
+with_recovery_port_forward() (
+  local callback="$1"
+  local recovery_log
+  local recovery_pid
+  local ready=false
+  local check
+
+  LOCAL_PORT="$(DATABASE_URL="$DATABASE_URL" python - <<'PY'
+import os
+from urllib.parse import urlsplit
+
+port = urlsplit(os.environ["DATABASE_URL"]).port
+if port is None:
+    raise SystemExit("database URL has no local port")
+print(port)
+PY
+)"
+  recovery_log="$(mktemp "/tmp/sealos-fastapi-postgres-${RUN_ID}-recovery.XXXXXX.log")"
+  nohup kubectl --namespace "$NAMESPACE" port-forward --address 127.0.0.1 \
+    "service/$SERVICE_NAME" "${LOCAL_PORT}:5432" </dev/null >"$recovery_log" 2>&1 &
+  recovery_pid=$!
+  PORT_FORWARD_PID="$recovery_pid"
+
+  cleanup_recovery_port_forward() {
+    local status=$?
+
+    trap - EXIT INT TERM HUP
+    set +e
+    if process_is_alive "$recovery_pid"; then
+      kill "$recovery_pid" 2>/dev/null
+      wait "$recovery_pid" 2>/dev/null || true
+    fi
+    rm -f "$recovery_log"
+    printf 'RECOVERY_PORT_FORWARD_STOPPED run_id=%s pid=%s\n' "$RUN_ID" "$recovery_pid"
+    exit "$status"
+  }
+  trap cleanup_recovery_port_forward EXIT INT TERM HUP
+
+  for check in $(seq 1 60); do
+    if ! process_is_alive "$recovery_pid"; then
+      sed -E 's#postgresql(\+psycopg)?://[^@[:space:]]+@#postgresql+psycopg://REDACTED@#g' "$recovery_log" >&2
+      fail "recovery port-forward stopped before readiness"
+    fi
+    if python - "$LOCAL_PORT" 2>/dev/null <<'PY'
+import socket
+import sys
+
+with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=0.25):
+    pass
+PY
+    then
+      ready=true
+      break
+    fi
+    sleep 0.5
+  done
+  [[ "$ready" == true ]] || fail "recovery port-forward did not become ready"
+  printf 'RECOVERY_PORT_FORWARD_READY run_id=%s local_port=%s pid=%s\n' \
+    "$RUN_ID" "$LOCAL_PORT" "$recovery_pid"
+  "$callback"
+)
+
 provision() {
   preflight_cluster
   POSTGRES_PASSWORD="$(new_password)"
@@ -470,9 +540,12 @@ require_supervisor_identity() {
   command="$(process_command "$SUPERVISOR_PID")"
   [[ "$command" == *"test-postgres.sh"*"--supervisor"*"--state-file"*"$STATE_FILE"* ]] || fail "recorded supervisor identity does not match the state file"
 
-  process_is_alive "$PORT_FORWARD_PID" || fail "recorded port-forward is not running"
-  command="$(process_command "$PORT_FORWARD_PID")"
-  [[ "$command" == *"kubectl"*"port-forward"*"service/$SERVICE_NAME"* ]] || fail "recorded port-forward identity does not match the run"
+  if process_is_alive "$PORT_FORWARD_PID"; then
+    command="$(process_command "$PORT_FORWARD_PID")"
+    [[ "$command" == *"kubectl"*"port-forward"*"service/$SERVICE_NAME"* ]] || fail "recorded port-forward identity does not match the run"
+  else
+    printf 'PORT_FORWARD_RECONNECT_REQUIRED run_id=%s recorded_pid=%s\n' "$RUN_ID" "$PORT_FORWARD_PID"
+  fi
 }
 
 stop_session() {
@@ -497,6 +570,7 @@ stop_session() {
 assert_clean_session() {
   local state_file="$1"
   local inventory
+  local matching_port_forwards
 
   STATE_FILE="$state_file"
   validate_state_file "$state_file"
@@ -504,6 +578,8 @@ assert_clean_session() {
   process_is_alive "$PORT_FORWARD_PID" && fail "recorded port-forward is still running"
   inventory="$(kubectl --namespace "$NAMESPACE" get job,deploy,svc,secret,configmap,pod -l "$RUN_LABEL" -o name)"
   [[ -z "$inventory" ]] || fail "owned Kubernetes resources remain after cleanup"
+  matching_port_forwards="$(ps -axo pid=,comm=,args= | awk -v service="service/$SERVICE_NAME" '$2 ~ /(^|\/)kubectl$/ && index($0, "port-forward") && index($0, service) {print $1}')"
+  [[ -z "$matching_port_forwards" ]] || fail "owned recovery port-forward remains after cleanup"
   grep -F "CLEANUP_OK run_id=$RUN_ID inventory=0 port_forward=stopped" "$SUPERVISOR_LOG" >/dev/null || fail "cleanup proof is missing"
   rm -f "$state_file" "$SUPERVISOR_LOG" "$PORT_FORWARD_LOG"
   printf 'ASSERT_CLEAN_OK run_id=%s inventory=0 processes=stopped\n' "$RUN_ID"
@@ -531,9 +607,180 @@ run_migrations() {
   DATABASE_URL="$DATABASE_URL" uv run alembic current
 }
 
+ensure_secret_database_url() {
+  DATABASE_URL="$DATABASE_URL" python - "$SECRET_NAME" "$RUN_ID" "$RUN_LABEL_KEY" "$SERVICE_NAME" <<'PY' | kubectl --namespace "$NAMESPACE" apply -f - >/dev/null
+import json
+import os
+import sys
+from urllib.parse import urlsplit
+
+name, run_id, label_key, service_name = sys.argv[1:]
+parsed = urlsplit(os.environ["DATABASE_URL"])
+if not parsed.username or not parsed.password or not parsed.path.strip("/"):
+    raise SystemExit("database URL is missing required components")
+
+database = parsed.path.strip("/")
+document = {
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "metadata": {"name": name, "labels": {label_key: run_id}},
+    "type": "Opaque",
+    "stringData": {
+        "username": parsed.username,
+        "password": parsed.password,
+        "database": database,
+        "url": (
+            f"postgresql+psycopg://{parsed.username}:{parsed.password}@"
+            f"{service_name}:5432/{database}"
+        ),
+    },
+}
+print(json.dumps(document))
+PY
+}
+
+create_source_configmap() {
+  local source_file
+
+  for source_file in \
+    app/models.py \
+    alembic.ini \
+    migrations/env.py \
+    migrations/script.py.mako \
+    migrations/versions/0001_create_tasks.py \
+    requirements.txt; do
+    [[ -f "$source_file" ]] || fail "source Job input is missing: $source_file"
+    git ls-files --error-unmatch "$source_file" >/dev/null || fail "source Job input is untracked: $source_file"
+  done
+
+  python - "$SOURCE_CONFIGMAP_NAME" "$RUN_ID" "$RUN_LABEL_KEY" <<'PY' | kubectl --namespace "$NAMESPACE" apply -f - >/dev/null
+import json
+from pathlib import Path
+import sys
+
+name, run_id, label_key = sys.argv[1:]
+sources = {
+    "app-models.py": "app/models.py",
+    "alembic.ini": "alembic.ini",
+    "migration-env.py": "migrations/env.py",
+    "migration-script.py.mako": "migrations/script.py.mako",
+    "migration-0001.py": "migrations/versions/0001_create_tasks.py",
+    "requirements.txt": "requirements.txt",
+}
+document = {
+    "apiVersion": "v1",
+    "kind": "ConfigMap",
+    "metadata": {"name": name, "labels": {label_key: run_id}},
+    "data": {key: Path(path).read_text() for key, path in sources.items()},
+}
+print(json.dumps(document))
+PY
+}
+
+render_source_job() {
+  local job_name="$1"
+
+  python - deploy/source-migration-job.yaml "$job_name" "$RUN_ID" "$SECRET_NAME" "$SOURCE_CONFIGMAP_NAME" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+template_path, job_name, run_id, secret_name, configmap_name = sys.argv[1:]
+template = Path(template_path).read_text()
+values = {
+    "__JOB_NAME__": job_name,
+    "__RUN_ID__": run_id,
+    "__SECRET_NAME__": secret_name,
+    "__CONFIGMAP_NAME__": configmap_name,
+}
+tokens = set(re.findall(r"__[A-Z0-9_]+__", template))
+if tokens != set(values):
+    raise SystemExit("source Job template contains an unexpected token set")
+
+rendered = template
+for token, value in values.items():
+    rendered = rendered.replace(token, value)
+if re.search(r"__[A-Z0-9_]+__", rendered):
+    raise SystemExit("source Job template contains an unresolved token")
+print(rendered, end="")
+PY
+}
+
+run_source_job() (
+  local sequence="$1"
+  local job_name="${RESOURCE_PREFIX}-${RUN_ID}-migration-${sequence}"
+  local rendered_manifest
+  local manifest_sha256
+  local job_logs
+  local complete_status
+
+  rendered_manifest="$(mktemp "/tmp/sealos-fastapi-source-job-${RUN_ID}-${sequence}.XXXXXX.yaml")"
+  trap 'rm -f "$rendered_manifest"' EXIT
+  render_source_job "$job_name" >"$rendered_manifest"
+  ! rg -n '__[A-Z0-9_]+__' "$rendered_manifest" >/dev/null || fail "rendered source Job has unresolved tokens"
+  kubectl --namespace "$NAMESPACE" apply --dry-run=server --validate=strict -f "$rendered_manifest" >/dev/null
+  manifest_sha256="$(shasum -a 256 "$rendered_manifest" | awk '{print $1}')"
+
+  kubectl --namespace "$NAMESPACE" apply --validate=strict -f "$rendered_manifest" >/dev/null
+  kubectl --namespace "$NAMESPACE" wait --for=condition=complete "job/$job_name" --timeout="${JOB_WAIT_SECONDS}s" >/dev/null
+  complete_status="$(kubectl --namespace "$NAMESPACE" get "job/$job_name" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}')"
+  [[ "$complete_status" == "True" ]] || fail "source migration Job did not report Complete: $job_name"
+
+  job_logs="$(kubectl --namespace "$NAMESPACE" logs "job/$job_name")"
+  ! grep -Eq 'postgresql(\+psycopg)?://|DATABASE_URL=|password=' <<<"$job_logs" || fail "source migration Job logs contain sensitive data"
+  grep -F '0001 (head)' <<<"$job_logs" >/dev/null || fail "source migration Job did not report revision 0001"
+  printf 'MIGRATION_JOB_COMPLETE run_id=%s sequence=%s job=%s status=True revision=0001 manifest_sha256=%s\n' \
+    "$RUN_ID" "$sequence" "$job_name" "$manifest_sha256"
+
+  kubectl --namespace "$NAMESPACE" delete "job/$job_name" --wait=true --timeout=90s >/dev/null
+  ! kubectl --namespace "$NAMESPACE" get "job/$job_name" >/dev/null 2>&1 || fail "source migration Job remains after exact deletion: $job_name"
+)
+
+run_migrated_health() {
+  local health_log
+  local health_status
+
+  health_log="$(mktemp "/tmp/sealos-fastapi-health-${RUN_ID}.XXXXXX.log")"
+  set +e
+  DATABASE_URL="$DATABASE_URL" TEST_DATABASE_URL="$TEST_DATABASE_URL" uv run pytest \
+    tests/test_health.py::test_health_accepts_migrated_database -q -x >"$health_log" 2>&1
+  health_status=$?
+  set -e
+  sed -E 's#postgresql(\+psycopg)?://[^@[:space:]]+@#postgresql+psycopg://REDACTED@#g' "$health_log"
+  rm -f "$health_log"
+  [[ "$health_status" == 0 ]] || fail "migrated public health check failed"
+}
+
 run_jobs() {
+  local remaining_jobs
+
+  [[ -f deploy/migration-job.yaml ]] || fail "deploy/migration-job.yaml is required for --jobs-only"
   [[ -f deploy/source-migration-job.yaml ]] || fail "deploy/source-migration-job.yaml is required for --jobs-only"
-  fail "source migration Job execution is added by Phase 22 Plan 03"
+  kubectl --namespace "$NAMESPACE" apply --dry-run=server --validate=strict -f deploy/migration-job.yaml >/dev/null
+  printf 'PRODUCTION_JOB_VALIDATED image=stage-2-postgresql command=alembic-upgrade-head secret_key=url\n'
+
+  ensure_secret_database_url
+  create_source_configmap
+  assert_inventory_names_match_run
+  run_source_job 1
+  run_source_job 2
+
+  if process_is_alive "$PORT_FORWARD_PID"; then
+    run_migrated_health
+  else
+    with_recovery_port_forward run_migrated_health
+  fi
+  kubectl --namespace "$NAMESPACE" delete "configmap/$SOURCE_CONFIGMAP_NAME" --wait=true --timeout=90s >/dev/null
+  remaining_jobs="$(kubectl --namespace "$NAMESPACE" get job -l "$RUN_LABEL" -o name)"
+  [[ -z "$remaining_jobs" ]] || fail "source migration Jobs remain after exact deletion"
+  printf 'MIGRATION_JOBS_OK run_id=%s completions=2 revision=0001 health=200\n' "$RUN_ID"
+}
+
+run_reproducibility_checks() {
+  uv lock --check
+  uv export --locked --no-dev --no-emit-project --no-hashes \
+    --format requirements.txt --output-file requirements.txt >/dev/null
+  git diff --exit-code -- requirements.txt
 }
 
 dispatch_attached_mode() {
@@ -549,9 +796,12 @@ dispatch_attached_mode() {
       run_jobs
       ;;
     phase-gate)
+      DATABASE_URL="$DATABASE_URL" TEST_DATABASE_URL="$TEST_DATABASE_URL" uv run pytest \
+        tests/test_health.py::test_health_waits_for_migrated_schema -q -x
       run_migrations
       DATABASE_URL="$DATABASE_URL" TEST_DATABASE_URL="$TEST_DATABASE_URL" uv run pytest -q
       run_jobs
+      run_reproducibility_checks
       ;;
     *)
       fail "unsupported execution mode: $MODE"
@@ -643,7 +893,11 @@ case "$MODE" in
       validate_state_file "$STATE_FILE"
       require_supervisor_identity
       assert_inventory_names_match_run
-      dispatch_attached_mode
+      if process_is_alive "$PORT_FORWARD_PID"; then
+        dispatch_attached_mode
+      else
+        with_recovery_port_forward dispatch_attached_mode
+      fi
     else
       run_one_shot
     fi
