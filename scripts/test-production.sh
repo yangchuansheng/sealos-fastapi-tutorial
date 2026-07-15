@@ -94,6 +94,8 @@ stop_application_port_forward() {
     done
     wait "$APP_PORT_FORWARD_PID" 2>/dev/null || true
     process_is_alive "$APP_PORT_FORWARD_PID" && return 1
+  else
+    wait "$APP_PORT_FORWARD_PID" 2>/dev/null || true
   fi
   APP_PORT_FORWARD_PID=""
 }
@@ -537,6 +539,7 @@ start_application_port_forward() {
   local ready=false
   local check
 
+  stop_application_port_forward
   APP_LOCAL_PORT="$(new_local_port)"
   nohup kubectl --namespace "$NAMESPACE" port-forward --address 127.0.0.1 \
     "service/$APP_NAME" "${APP_LOCAL_PORT}:8000" </dev/null \
@@ -890,6 +893,7 @@ verify_release_state() {
   done
   rm -f "$pod_log"
 
+  start_application_port_forward
   verify_http_state "$sequence" "$state"
   case "$transition" in
     rollout-undo)
@@ -919,7 +923,6 @@ run_production_sequence() {
 
   run_migration_job 1 baseline "$BASELINE_JOB_NAME" "$BASELINE_IMAGE" "$BASELINE_SOURCE"
   apply_release baseline "$BASELINE_IMAGE" "$BASELINE_SOURCE"
-  start_application_port_forward
   verify_release_state 1 baseline baseline-deploy \
     "$BASELINE_IMAGE" "$BASELINE_SOURCE" "$BASELINE_RUNTIME_DIGEST"
 
