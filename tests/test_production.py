@@ -511,6 +511,7 @@ def test_production_workload_contract() -> None:
     assert 'assert container["volumeMounts"] == [' in harness
     assert '"name": "logging"' in harness
     assert '"configMap": {' in harness
+    assert '"defaultMode": 420' in harness
     assert '"name": app_name' in harness
     assert '"key": "logging.json"' in harness
     assert '"path": "logging.json"' in harness
