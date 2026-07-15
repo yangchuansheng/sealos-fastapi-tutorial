@@ -75,3 +75,10 @@ def test_delete_task(client: TestClient) -> None:
     assert response.status_code == 204
     assert response.content == b""
     assert client.get(f"/tasks/{task_id}").status_code == 404
+
+
+@pytest.mark.parametrize("title", ["", "x" * 201])
+def test_reject_invalid_task(client: TestClient, title: str) -> None:
+    response = client.post("/tasks", json={"title": title})
+
+    assert response.status_code == 422
