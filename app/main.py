@@ -1,14 +1,37 @@
 from fastapi import FastAPI
+from pydantic import BaseModel
 
-__all__ = ["app", "create_app"]
+__all__ = ["Task", "TaskCreate", "app", "create_app"]
+
+
+class TaskCreate(BaseModel):
+    title: str
+    completed: bool = False
+
+
+class Task(BaseModel):
+    id: int
+    title: str
+    completed: bool
 
 
 def create_app() -> FastAPI:
     application = FastAPI(title="Tasks API", version="0.1.0")
+    tasks: dict[int, Task] = {}
+    next_task_id = 1
 
     @application.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @application.post("/tasks", response_model=Task, status_code=201)
+    def create_task(payload: TaskCreate) -> Task:
+        nonlocal next_task_id
+
+        task = Task(id=next_task_id, **payload.model_dump())
+        tasks[task.id] = task
+        next_task_id += 1
+        return task
 
     return application
 
