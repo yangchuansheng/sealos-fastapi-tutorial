@@ -42,3 +42,13 @@ def test_list_tasks(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == [created.json()]
+
+
+def test_get_task(client: TestClient) -> None:
+    created = client.post("/tasks", json={"title": "Write tutorial"})
+    task_id = created.json()["id"]
+
+    response = client.get(f"/tasks/{task_id}")
+
+    assert response.status_code == 200
+    assert response.json() == created.json()
