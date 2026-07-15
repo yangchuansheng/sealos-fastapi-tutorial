@@ -1,16 +1,16 @@
 from fastapi import FastAPI, HTTPException, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 __all__ = ["Task", "TaskCreate", "TaskUpdate", "app", "create_app"]
 
 
 class TaskCreate(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=200)
     completed: bool = False
 
 
 class TaskUpdate(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=200)
     completed: bool
 
 
