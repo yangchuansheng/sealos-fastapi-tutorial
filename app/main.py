@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import DatabaseRuntime
@@ -70,8 +71,18 @@ def create_app(database_url: str | None = None) -> FastAPI:
         )
 
     @application.get("/tasks", response_model=list[Task])
-    def list_tasks() -> list[Task]:
-        return [tasks[task_id] for task_id in sorted(tasks)]
+    def list_tasks(
+        session: Session = Depends(runtime.get_session),
+    ) -> list[Task]:
+        records = session.scalars(select(TaskRecord).order_by(TaskRecord.id)).all()
+        return [
+            Task(
+                id=record.id,
+                title=record.title,
+                completed=record.completed,
+            )
+            for record in records
+        ]
 
     @application.get("/tasks/{task_id}", response_model=Task)
     def get_task(
