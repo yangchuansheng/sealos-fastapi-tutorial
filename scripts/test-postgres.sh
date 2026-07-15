@@ -123,7 +123,7 @@ PY
 evidence_append() {
   local filename="$1"
   shift
-  [[ "$EVIDENCE_ENABLED" == true ]] || return
+  [[ "$EVIDENCE_ENABLED" == true ]] || return 0
   printf '%s\n' "$*" >>"$EVIDENCE_DIR/$filename"
 }
 
