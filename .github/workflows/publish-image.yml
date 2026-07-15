@@ -181,6 +181,7 @@ jobs:
         id: tag
         env:
           CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -205,13 +206,30 @@ jobs:
             test "$existing_digest" = "$CANDIDATE_DIGEST"
             publish_needed=false
           else
-            if ! grep -Eqi 'not found|manifest unknown|name unknown|unauthorized' \
+            if grep -Eqi 'not found|manifest unknown|name unknown' \
               <<<"$inspect_output"; then
+              existing_digest=""
+              publish_needed=true
+            elif grep -Fq 'failed to authorize' <<<"$inspect_output" \
+              && grep -Fq '403 Forbidden' <<<"$inspect_output"; then
+              package_response="$ANON_DOCKER_CONFIG/package.json"
+              package_status="$(curl --silent --show-error \
+                --output "$package_response" --write-out '%{http_code}' \
+                --header "Authorization: Bearer $GITHUB_TOKEN" \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                'https://api.github.com/users/yangchuansheng/packages/container/sealos-fastapi-tutorial')"
+              if [[ "$package_status" != "404" ]]; then
+                echo "Anonymous 403 is accepted only while the package is absent" >&2
+                echo "package_status=$package_status" >&2
+                exit 1
+              fi
+              existing_digest=""
+              publish_needed=true
+            else
               echo "$inspect_output" >&2
               exit "$inspect_status"
             fi
-            existing_digest=""
-            publish_needed=true
           fi
 
           echo "candidate_digest=$CANDIDATE_DIGEST"

@@ -120,6 +120,13 @@ def test_publisher_uses_one_validated_source_identity() -> None:
     assert POSTGRES_IMAGE in workflow
     assert "ANON_DOCKER_CONFIG" in workflow
     assert 'chmod 700 "$ANON_DOCKER_CONFIG"' in workflow
+    assert "failed to authorize" in workflow
+    assert "403 Forbidden" in workflow
+    assert (
+        "api.github.com/users/yangchuansheng/packages/container/"
+        "sealos-fastapi-tutorial"
+    ) in workflow
+    assert "package_status" in workflow
     assert "candidate_digest" in workflow
     assert "publish_needed" in workflow
     assert "type=ref" not in workflow
