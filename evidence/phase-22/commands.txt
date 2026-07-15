@@ -1,0 +1,8 @@
+uv sync --locked
+uv lock --check
+uv export --locked --no-dev --no-emit-project --no-hashes --format requirements.txt --output-file requirements.txt
+git diff --exit-code -- requirements.txt
+DATABASE_URL=<redacted> uv run alembic upgrade head
+TEST_DATABASE_URL=<redacted> uv run pytest -q
+kubectl apply --dry-run=server --validate=strict -f deploy/migration-job.yaml
+PHASE22_EVIDENCE_DIR=<evidence-dir> ./scripts/test-postgres.sh --phase-gate

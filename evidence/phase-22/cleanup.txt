@@ -1,0 +1,3 @@
+run_id=290c28e99083 selector=tutorial.sealos.io/run-id=290c28e99083
+deployment=0 pod=0 service=0 job=0 secret=0 configmap=0
+port_forward=stopped owned_processes=0

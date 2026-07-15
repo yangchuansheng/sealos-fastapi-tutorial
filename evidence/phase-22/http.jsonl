@@ -1,0 +1,9 @@
+{"application":"A","body":{"status":"ok"},"method":"GET","path":"/health","sequence":1,"status":200}
+{"application":"A","body":{"contains":"Swagger UI"},"method":"GET","path":"/docs","sequence":2,"status":200}
+{"application":"A","body":{"completed":false,"id":1,"title":"Record PostgreSQL evidence"},"method":"POST","path":"/tasks","sequence":3,"status":201}
+{"application":"B","body":{"completed":false,"id":1,"title":"Record PostgreSQL evidence"},"method":"GET","path":"/tasks/1","sequence":4,"status":200}
+{"application":"B","body":[{"completed":false,"id":1,"title":"Record PostgreSQL evidence"}],"method":"GET","path":"/tasks","sequence":5,"status":200}
+{"application":"B","body":{"completed":true,"id":1,"title":"Publish PostgreSQL evidence"},"method":"PUT","path":"/tasks/1","sequence":6,"status":200}
+{"application":"C","body":{"completed":true,"id":1,"title":"Publish PostgreSQL evidence"},"method":"GET","path":"/tasks/1","sequence":7,"status":200}
+{"application":"C","body":null,"method":"DELETE","path":"/tasks/1","sequence":8,"status":204}
+{"application":"C","body":{"detail":"Task not found"},"method":"GET","path":"/tasks/1","sequence":9,"status":404}

@@ -29,6 +29,8 @@ POSTGRES_PASSWORD=""
 CLEANUP_REQUIRED=false
 PORT_FORWARD_LOG=""
 SUPERVISOR_LOG=""
+EVIDENCE_DIR="${PHASE22_EVIDENCE_DIR:-}"
+EVIDENCE_ENABLED=false
 
 usage() {
   cat <<'EOF'
@@ -46,6 +48,152 @@ EOF
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
+}
+
+prepare_evidence() {
+  [[ -n "$EVIDENCE_DIR" ]] || return
+
+  EVIDENCE_DIR="$(python - "$EVIDENCE_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1]).expanduser()
+if path.exists() and (path.is_symlink() or not path.is_dir()):
+    raise SystemExit("evidence path must be a real directory")
+path.mkdir(parents=True, exist_ok=True)
+if any(path.iterdir()):
+    raise SystemExit("evidence directory must be empty")
+resolved = path.resolve()
+if resolved == Path("/"):
+    raise SystemExit("evidence directory cannot be the filesystem root")
+print(resolved)
+PY
+)"
+  EVIDENCE_ENABLED=true
+  umask 077
+
+  python - "$EVIDENCE_DIR" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+(root / "README.md").write_text(
+    """# Phase 22 PostgreSQL Evidence
+
+This directory contains curated, credential-free output from one complete
+real-PostgreSQL phase gate. Generated database passwords, Secret payloads,
+tokens, namespace credentials, and credential-bearing URLs are excluded before
+disk write.
+
+| File | Scope | Reproduction command |
+|------|-------|----------------------|
+| `commands.txt` | Locked install, export, migration, tests, Job validation, and full-gate commands | Follow the commands in file order. |
+| `migrations.txt` | Fresh and repeat Alembic upgrade at revision `0001` | `DATABASE_URL=<redacted> uv run alembic upgrade head` |
+| `http.jsonl` | Health, Swagger UI, cross-instance CRUD, deletion, and stable 404 through public HTTP | `TEST_DATABASE_URL=<redacted> uv run pytest -q` |
+| `jobs.txt` | Strict production manifest validation and two source Job `Complete` conditions | `./scripts/test-postgres.sh --jobs-only --state-file <state-file>` |
+| `cleanup.txt` | Exact-label zero inventory and stopped owned port-forward | `./scripts/test-postgres.sh --assert-clean --state-file <state-file>` |
+| `checksums.txt` | SHA-256 manifest over every retained evidence file above | `sha256sum -c evidence/phase-22/checksums.txt` |
+
+The full reproduction command is:
+
+```bash
+PHASE22_EVIDENCE_DIR=evidence/phase-22 \\
+  ./scripts/test-postgres.sh --phase-gate
+```
+""",
+    encoding="utf-8",
+)
+(root / "commands.txt").write_text(
+    """uv sync --locked
+uv lock --check
+uv export --locked --no-dev --no-emit-project --no-hashes --format requirements.txt --output-file requirements.txt
+git diff --exit-code -- requirements.txt
+DATABASE_URL=<redacted> uv run alembic upgrade head
+TEST_DATABASE_URL=<redacted> uv run pytest -q
+kubectl apply --dry-run=server --validate=strict -f deploy/migration-job.yaml
+PHASE22_EVIDENCE_DIR=<evidence-dir> ./scripts/test-postgres.sh --phase-gate
+""",
+    encoding="utf-8",
+)
+for name in ("migrations.txt", "http.jsonl", "jobs.txt", "cleanup.txt"):
+    (root / name).write_text("", encoding="utf-8")
+PY
+}
+
+evidence_append() {
+  local filename="$1"
+  shift
+  [[ "$EVIDENCE_ENABLED" == true ]] || return
+  printf '%s\n' "$*" >>"$EVIDENCE_DIR/$filename"
+}
+
+finalize_evidence() {
+  [[ "$EVIDENCE_ENABLED" == true ]] || return
+
+  python - "$EVIDENCE_DIR" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+root = Path(sys.argv[1])
+files = [
+    root / "README.md",
+    root / "commands.txt",
+    root / "migrations.txt",
+    root / "http.jsonl",
+    root / "jobs.txt",
+    root / "cleanup.txt",
+]
+patterns = {
+    "credential-bearing PostgreSQL URL": re.compile(
+        r"postgresql(?:\+psycopg)?://[^\s/:]+:[^\s@]+@",
+        re.IGNORECASE,
+    ),
+    "GitHub token": re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
+    "bearer token": re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{16,}", re.IGNORECASE),
+    "Kubernetes token": re.compile(r"\beyJhbGciOiJ[A-Za-z0-9._-]+"),
+    "unredacted database assignment": re.compile(
+        r"(?:DATABASE_URL|TEST_DATABASE_URL)=postgresql",
+        re.IGNORECASE,
+    ),
+    "unredacted password assignment": re.compile(
+        r"password=(?!<redacted>)[^\s]+",
+        re.IGNORECASE,
+    ),
+}
+for path in files:
+    text = path.read_text(encoding="utf-8")
+    for label, pattern in patterns.items():
+        if pattern.search(text):
+            raise SystemExit(f"{path.name}: found {label}")
+PY
+
+  python - "$EVIDENCE_DIR" <<'PY'
+from hashlib import sha256
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1]).resolve()
+try:
+    display_root = root.relative_to(Path.cwd().resolve())
+except ValueError:
+    display_root = root
+names = (
+    "README.md",
+    "commands.txt",
+    "migrations.txt",
+    "http.jsonl",
+    "jobs.txt",
+    "cleanup.txt",
+)
+lines = []
+for name in names:
+    digest = sha256((root / name).read_bytes()).hexdigest()
+    lines.append(f"{digest}  {display_root / name}")
+(root / "checksums.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+  sha256sum -c "$EVIDENCE_DIR/checksums.txt" >/dev/null
+  printf 'EVIDENCE_OK directory=%s files=7 redaction=passed checksums=passed\n' "$EVIDENCE_DIR"
 }
 
 state_mode() {
@@ -408,6 +556,7 @@ cleanup() {
   local cleanup_status=0
   local inventory
   local check
+  local matching_port_forwards
 
   trap - EXIT INT TERM HUP
   set +e
@@ -438,7 +587,19 @@ cleanup() {
     [[ -z "$inventory" ]] || cleanup_status=1
   fi
 
+  matching_port_forwards="$(ps -axo pid=,comm=,args= | awk -v service="service/$SERVICE_NAME" '$2 ~ /(^|\/)kubectl$/ && index($0, "port-forward") && index($0, service) {print $1}')"
+  [[ -z "$matching_port_forwards" ]] || cleanup_status=1
+
   rm -f "$PORT_FORWARD_LOG"
+
+  if [[ "$cleanup_status" == 0 ]]; then
+    evidence_append cleanup.txt "run_id=$RUN_ID selector=$RUN_LABEL"
+    evidence_append cleanup.txt "deployment=0 pod=0 service=0 job=0 secret=0 configmap=0"
+    evidence_append cleanup.txt "port_forward=stopped owned_processes=0"
+    if [[ "$status" == 0 ]]; then
+      finalize_evidence || cleanup_status=1
+    fi
+  fi
 
   if [[ "$cleanup_status" == 0 ]]; then
     printf 'CLEANUP_OK run_id=%s inventory=0 port_forward=stopped\n' "$RUN_ID"
@@ -616,10 +777,182 @@ run_redacted_pytest() (
   exit "$pytest_status"
 )
 
+capture_public_http_evidence() (
+  local capture_log
+  local capture_status
+
+  [[ "$EVIDENCE_ENABLED" == true ]] || return
+  capture_log="$(mktemp "/tmp/sealos-fastapi-http-evidence-${RUN_ID}.XXXXXX.log")"
+  trap 'rm -f "$capture_log"' EXIT INT TERM HUP
+  set +e
+  DATABASE_URL="$DATABASE_URL" EVIDENCE_OUTPUT="$EVIDENCE_DIR/http.jsonl" \
+    uv run python - <<'PY' >"$capture_log" 2>&1
+import json
+import os
+from pathlib import Path
+
+from fastapi.testclient import TestClient
+
+from app.main import create_app
+
+
+database_url = os.environ["DATABASE_URL"]
+output = Path(os.environ["EVIDENCE_OUTPUT"])
+records: list[dict[str, object]] = []
+
+
+def record(
+    sequence: int,
+    application: str,
+    method: str,
+    path: str,
+    response,
+    expected_status: int,
+    expected_body: object,
+) -> None:
+    assert response.status_code == expected_status, response.text
+    body = None if response.status_code == 204 else response.json()
+    assert body == expected_body, body
+    records.append(
+        {
+            "application": application,
+            "body": body,
+            "method": method,
+            "path": path,
+            "sequence": sequence,
+            "status": response.status_code,
+        }
+    )
+
+
+with TestClient(create_app(database_url)) as application_a:
+    record(
+        1,
+        "A",
+        "GET",
+        "/health",
+        application_a.get("/health"),
+        200,
+        {"status": "ok"},
+    )
+    docs = application_a.get("/docs")
+    assert docs.status_code == 200
+    assert "Swagger UI" in docs.text
+    records.append(
+        {
+            "application": "A",
+            "body": {"contains": "Swagger UI"},
+            "method": "GET",
+            "path": "/docs",
+            "sequence": 2,
+            "status": 200,
+        }
+    )
+    created = application_a.post(
+        "/tasks",
+        json={"title": "Record PostgreSQL evidence"},
+    )
+    record(
+        3,
+        "A",
+        "POST",
+        "/tasks",
+        created,
+        201,
+        {"id": 1, "title": "Record PostgreSQL evidence", "completed": False},
+    )
+
+with TestClient(create_app(database_url)) as application_b:
+    record(
+        4,
+        "B",
+        "GET",
+        "/tasks/1",
+        application_b.get("/tasks/1"),
+        200,
+        {"id": 1, "title": "Record PostgreSQL evidence", "completed": False},
+    )
+    record(
+        5,
+        "B",
+        "GET",
+        "/tasks",
+        application_b.get("/tasks"),
+        200,
+        [{"id": 1, "title": "Record PostgreSQL evidence", "completed": False}],
+    )
+    record(
+        6,
+        "B",
+        "PUT",
+        "/tasks/1",
+        application_b.put(
+            "/tasks/1",
+            json={"title": "Publish PostgreSQL evidence", "completed": True},
+        ),
+        200,
+        {"id": 1, "title": "Publish PostgreSQL evidence", "completed": True},
+    )
+
+with TestClient(create_app(database_url)) as application_c:
+    record(
+        7,
+        "C",
+        "GET",
+        "/tasks/1",
+        application_c.get("/tasks/1"),
+        200,
+        {"id": 1, "title": "Publish PostgreSQL evidence", "completed": True},
+    )
+    record(
+        8,
+        "C",
+        "DELETE",
+        "/tasks/1",
+        application_c.delete("/tasks/1"),
+        204,
+        None,
+    )
+    record(
+        9,
+        "C",
+        "GET",
+        "/tasks/1",
+        application_c.get("/tasks/1"),
+        404,
+        {"detail": "Task not found"},
+    )
+
+serialized = "\n".join(
+    json.dumps(item, sort_keys=True, separators=(",", ":"))
+    for item in records
+)
+for forbidden in ("postgresql://", "postgresql+psycopg://", "password", "token"):
+    assert forbidden not in serialized.lower()
+output.write_text(f"{serialized}\n", encoding="utf-8")
+PY
+  capture_status=$?
+  set -e
+  if [[ "$capture_status" != 0 ]]; then
+    sed -E 's#postgresql(\+psycopg)?://[^@[:space:]]+@#postgresql+psycopg://REDACTED@#g' "$capture_log" >&2
+    exit "$capture_status"
+  fi
+  printf 'HTTP_EVIDENCE_OK run_id=%s applications=3 requests=9\n' "$RUN_ID"
+)
+
 run_migrations() {
+  local current_revision
+
+  DATABASE_URL="$DATABASE_URL" uv run alembic downgrade base
   DATABASE_URL="$DATABASE_URL" uv run alembic upgrade head
+  current_revision="$(DATABASE_URL="$DATABASE_URL" uv run alembic current)"
+  grep -F '0001 (head)' <<<"$current_revision" >/dev/null || fail "fresh migration did not reach revision 0001"
+  evidence_append migrations.txt "run_id=$RUN_ID fresh_upgrade=passed revision=0001"
   DATABASE_URL="$DATABASE_URL" uv run alembic upgrade head
-  DATABASE_URL="$DATABASE_URL" uv run alembic current
+  current_revision="$(DATABASE_URL="$DATABASE_URL" uv run alembic current)"
+  grep -F '0001 (head)' <<<"$current_revision" >/dev/null || fail "repeat migration did not remain at revision 0001"
+  printf '%s\n' "$current_revision"
+  evidence_append migrations.txt "run_id=$RUN_ID repeat_upgrade=passed revision=0001"
 }
 
 ensure_secret_database_url() {
@@ -746,6 +1079,8 @@ run_source_job() (
   grep -F '0001 (head)' <<<"$job_logs" >/dev/null || fail "source migration Job did not report revision 0001"
   printf 'MIGRATION_JOB_COMPLETE run_id=%s sequence=%s job=%s status=True revision=0001 manifest_sha256=%s\n' \
     "$RUN_ID" "$sequence" "$job_name" "$manifest_sha256"
+  evidence_append jobs.txt \
+    "run_id=$RUN_ID sequence=$sequence job=$job_name condition=Complete status=True revision=0001 manifest_sha256=$manifest_sha256"
 
   kubectl --namespace "$NAMESPACE" delete "job/$job_name" --wait=true --timeout=90s >/dev/null
   ! kubectl --namespace "$NAMESPACE" get "job/$job_name" >/dev/null 2>&1 || fail "source migration Job remains after exact deletion: $job_name"
@@ -764,6 +1099,8 @@ run_jobs() {
   [[ -f deploy/source-migration-job.yaml ]] || fail "deploy/source-migration-job.yaml is required for --jobs-only"
   kubectl --namespace "$NAMESPACE" apply --dry-run=server --validate=strict -f deploy/migration-job.yaml >/dev/null
   printf 'PRODUCTION_JOB_VALIDATED image=stage-2-postgresql command=alembic-upgrade-head secret_key=url\n'
+  evidence_append jobs.txt \
+    "production_manifest=validated image=stage-2-postgresql command=alembic-upgrade-head secret_key=url"
 
   ensure_secret_database_url
   create_source_configmap
@@ -806,6 +1143,7 @@ dispatch_attached_mode() {
         tests/test_health.py::test_health_waits_for_migrated_schema -q -x
       run_migrations
       run_redacted_pytest -q
+      capture_public_http_evidence
       run_jobs
       run_reproducibility_checks
       ;;
@@ -876,6 +1214,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$EVIDENCE_DIR" ]]; then
+  [[ "$MODE" == "phase-gate" ]] || fail "PHASE22_EVIDENCE_DIR requires --phase-gate"
+  prepare_evidence
+fi
 
 case "$MODE" in
   session-start)
