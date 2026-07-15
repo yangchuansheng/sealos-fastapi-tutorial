@@ -1,5 +1,12 @@
-from fastapi import FastAPI, HTTPException, Response
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from app.database import DatabaseRuntime
+from app.models import TaskRecord
 
 __all__ = ["Task", "TaskCreate", "TaskUpdate", "app", "create_app"]
 
@@ -20,8 +27,21 @@ class Task(BaseModel):
     completed: bool
 
 
-def create_app() -> FastAPI:
-    application = FastAPI(title="Tasks API", version="0.1.0")
+def create_app(database_url: str | None = None) -> FastAPI:
+    runtime = DatabaseRuntime(database_url or os.environ.get("DATABASE_URL"))
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        try:
+            yield
+        finally:
+            runtime.dispose()
+
+    application = FastAPI(
+        title="Tasks API",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
     tasks: dict[int, Task] = {}
     next_task_id = 1
 
@@ -35,21 +55,37 @@ def create_app() -> FastAPI:
         return {"status": "ok"}
 
     @application.post("/tasks", response_model=Task, status_code=201)
-    def create_task(payload: TaskCreate) -> Task:
-        nonlocal next_task_id
-
-        task = Task(id=next_task_id, **payload.model_dump())
-        tasks[task.id] = task
-        next_task_id += 1
-        return task
+    def create_task(
+        payload: TaskCreate,
+        session: Session = Depends(runtime.get_session),
+    ) -> Task:
+        record = TaskRecord(**payload.model_dump())
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        return Task(
+            id=record.id,
+            title=record.title,
+            completed=record.completed,
+        )
 
     @application.get("/tasks", response_model=list[Task])
     def list_tasks() -> list[Task]:
         return [tasks[task_id] for task_id in sorted(tasks)]
 
     @application.get("/tasks/{task_id}", response_model=Task)
-    def get_task(task_id: int) -> Task:
-        return get_task_or_404(task_id)
+    def get_task(
+        task_id: int,
+        session: Session = Depends(runtime.get_session),
+    ) -> Task:
+        record = session.get(TaskRecord, task_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return Task(
+            id=record.id,
+            title=record.title,
+            completed=record.completed,
+        )
 
     @application.put("/tasks/{task_id}", response_model=Task)
     def update_task(task_id: int, payload: TaskUpdate) -> Task:
