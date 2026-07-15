@@ -6,6 +6,8 @@ EXPECTED_CONTEXT="dn9ue3wz@sealos"
 RUN_LABEL_KEY="tutorial.sealos.io/run-id"
 RESOURCE_PREFIX="tutorial-fastapi-pg-test"
 POSTGRES_IMAGE="postgres:17.10-bookworm@sha256:4f736ae292687621d4dbe0d499ffd024a36bd2ee7d8ca6f2ccd4c800f047b394"
+PRODUCTION_JOB_TEMPLATE="deploy/migration-job.yaml"
+PRODUCTION_VALIDATION_IMAGE="ghcr.io/yangchuansheng/sealos-fastapi-tutorial@sha256:b11293cf8ebb0e73fbabfd33ef6e812d53cb8176ea2db853769aae3dfa273337"
 POSTGRES_USER="tasks"
 POSTGRES_DB="tasks"
 WAIT_SECONDS=120
@@ -1092,15 +1094,89 @@ run_migrated_health() {
     fail "migrated public health check failed"
 }
 
+render_production_job() {
+  local job_name="$1"
+  local run_id="$2"
+  local secret_name="$3"
+  local image_reference="$4"
+
+  python - "$PRODUCTION_JOB_TEMPLATE" "$job_name" "$run_id" \
+    "$secret_name" "$image_reference" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+template_path, job_name, run_id, secret_name, image_reference = sys.argv[1:]
+if not re.fullmatch(r"[a-z0-9]{12}", run_id):
+    raise SystemExit("production Job run ID is unsafe")
+prefix = f"tutorial-fastapi-pg-test-{run_id}"
+if job_name != f"{prefix}-production-validation":
+    raise SystemExit("production Job name is outside run ownership")
+if secret_name != f"{prefix}-secret":
+    raise SystemExit("production Job Secret is outside run ownership")
+if not re.fullmatch(
+    r"ghcr\.io/yangchuansheng/sealos-fastapi-tutorial@sha256:[0-9a-f]{64}",
+    image_reference,
+):
+    raise SystemExit("production Job image is not an immutable public reference")
+
+template = Path(template_path).read_text(encoding="utf-8")
+values = {
+    "__RUN_ID__": run_id,
+    "__JOB_NAME__": job_name,
+    "__IMAGE_REFERENCE__": image_reference,
+    "__SECRET_NAME__": secret_name,
+}
+tokens = set(re.findall(r"__[A-Z0-9_]+__", template))
+if tokens != set(values):
+    raise SystemExit("production Job template contains an unexpected token set")
+rendered = template
+for token, value in values.items():
+    rendered = rendered.replace(token, value)
+if re.search(r"__[A-Z0-9_]+__", rendered):
+    raise SystemExit("production Job template contains an unresolved token")
+print(rendered, end="")
+PY
+}
+
+validate_production_job() (
+  local job_name="${RESOURCE_PREFIX}-${RUN_ID}-production-validation"
+  local rendered_manifest
+
+  [[ "$PRODUCTION_VALIDATION_IMAGE" =~ ^ghcr\.io/yangchuansheng/sealos-fastapi-tutorial@sha256:[0-9a-f]{64}$ ]] || fail "production validation image is unsafe"
+  rendered_manifest="$(mktemp "${TMPDIR:-/tmp}/sealos-fastapi-production-job-${RUN_ID}.XXXXXX.yaml")"
+  cleanup_production_render() {
+    local status=$?
+
+    trap - EXIT INT TERM HUP
+    rm -f "$rendered_manifest" || exit 1
+    [[ ! -e "$rendered_manifest" ]] || exit 1
+    exit "$status"
+  }
+  trap cleanup_production_render EXIT INT TERM HUP
+
+  render_production_job "$job_name" "$RUN_ID" "$SECRET_NAME" \
+    "$PRODUCTION_VALIDATION_IMAGE" >"$rendered_manifest"
+  chmod 600 "$rendered_manifest"
+  [[ "$(state_mode "$rendered_manifest")" == "600" ]] || fail "production render must have mode 0600"
+  ! grep -Eq '__[A-Z0-9_]+__' "$rendered_manifest" || fail "production Job render contains an unresolved token"
+  kubectl --namespace "$NAMESPACE" apply --dry-run=server --validate=strict \
+    -f "$rendered_manifest" >/dev/null
+  rm -f "$rendered_manifest"
+  [[ ! -e "$rendered_manifest" ]] || fail "production Job render cleanup failed"
+  trap - EXIT INT TERM HUP
+)
+
 run_jobs() {
   local remaining_jobs
 
   [[ -f deploy/migration-job.yaml ]] || fail "deploy/migration-job.yaml is required for --jobs-only"
   [[ -f deploy/source-migration-job.yaml ]] || fail "deploy/source-migration-job.yaml is required for --jobs-only"
-  kubectl --namespace "$NAMESPACE" apply --dry-run=server --validate=strict -f deploy/migration-job.yaml >/dev/null
-  printf 'PRODUCTION_JOB_VALIDATED image=stage-2-postgresql command=alembic-upgrade-head secret_key=url\n'
+  validate_production_job
+  printf 'PRODUCTION_JOB_VALIDATED image=%s command=alembic-upgrade-head secret_key=url\n' \
+    "$PRODUCTION_VALIDATION_IMAGE"
   evidence_append jobs.txt \
-    "production_manifest=validated image=stage-2-postgresql command=alembic-upgrade-head secret_key=url"
+    "production_manifest=validated image=$PRODUCTION_VALIDATION_IMAGE command=alembic-upgrade-head secret_key=url"
 
   ensure_secret_database_url
   create_source_configmap
