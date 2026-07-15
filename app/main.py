@@ -33,6 +33,10 @@ def create_app() -> FastAPI:
         next_task_id += 1
         return task
 
+    @application.get("/tasks", response_model=list[Task])
+    def list_tasks() -> list[Task]:
+        return [tasks[task_id] for task_id in sorted(tasks)]
+
     return application
 
 
