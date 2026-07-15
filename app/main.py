@@ -43,13 +43,6 @@ def create_app(database_url: str | None = None) -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
-    tasks: dict[int, Task] = {}
-    next_task_id = 1
-
-    def get_task_or_404(task_id: int) -> Task:
-        if task_id not in tasks:
-            raise HTTPException(status_code=404, detail="Task not found")
-        return tasks[task_id]
 
     @application.get("/health")
     def health() -> dict[str, str]:
@@ -119,10 +112,16 @@ def create_app(database_url: str | None = None) -> FastAPI:
         )
 
     @application.delete("/tasks/{task_id}", status_code=204)
-    def delete_task(task_id: int) -> Response:
-        get_task_or_404(task_id)
+    def delete_task(
+        task_id: int,
+        session: Session = Depends(runtime.get_session),
+    ) -> Response:
+        record = session.get(TaskRecord, task_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="Task not found")
 
-        del tasks[task_id]
+        session.delete(record)
+        session.commit()
         return Response(status_code=204)
 
     return application
