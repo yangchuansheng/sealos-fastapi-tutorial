@@ -628,6 +628,21 @@ assert template["securityContext"] == {
 }
 container = template["containers"][0]
 assert container["image"] == image
+assert container["command"] == ["uvicorn"]
+assert container["args"] == [
+    "app.main:app",
+    "--host",
+    "0.0.0.0",
+    "--port",
+    "8000",
+    "--workers",
+    "1",
+    "--log-level",
+    "info",
+    "--no-use-colors",
+    "--log-config",
+    "/etc/uvicorn/logging.json",
+]
 environment = {item["name"]: item for item in container["env"]}
 assert environment["SOURCE_RELEASE"]["value"] == source
 assert environment["IMAGE_REFERENCE"]["value"] == image
@@ -641,8 +656,19 @@ assert security["capabilities"]["drop"] == ["ALL"]
 assert container["ports"] == [{"containerPort": 8000, "name": "http", "protocol": "TCP"}]
 assert container["readinessProbe"]["httpGet"]["path"] == "/health"
 assert container["readinessProbe"]["httpGet"]["port"] == "http"
+assert container["volumeMounts"] == [
+    {"name": "tmp", "mountPath": "/tmp"},
+    {"name": "logging", "mountPath": "/etc/uvicorn", "readOnly": True},
+]
 assert template["volumes"] == [
-    {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "64Mi"}}
+    {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "64Mi"}},
+    {
+        "name": "logging",
+        "configMap": {
+            "name": app_name,
+            "items": [{"key": "logging.json", "path": "logging.json"}],
+        },
+    },
 ]
 
 revision = deployment["metadata"]["annotations"]["deployment.kubernetes.io/revision"]

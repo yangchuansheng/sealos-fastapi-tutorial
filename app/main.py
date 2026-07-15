@@ -13,6 +13,7 @@ from app.models import TaskRecord
 __all__ = ["Task", "TaskCreate", "TaskUpdate", "app", "create_app"]
 
 logger = logging.getLogger(__name__)
+release_logger = logging.getLogger("uvicorn.error")
 
 
 class TaskCreate(BaseModel):
@@ -36,7 +37,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
-        logger.info(
+        release_logger.info(
             "event=service_start source_release=%s image_reference=%s",
             os.environ.get("SOURCE_RELEASE", "unknown"),
             os.environ.get("IMAGE_REFERENCE", "unknown"),

@@ -1,3 +1,56 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: __APP_NAME__
+  labels:
+    app.kubernetes.io/name: __APP_NAME__
+    tutorial.sealos.io/run-id: __RUN_ID__
+data:
+  logging.json: |
+    {
+      "version": 1,
+      "disable_existing_loggers": false,
+      "formatters": {
+        "default": {
+          "format": "%(levelname)s: %(message)s"
+        },
+        "access": {
+          "format": "%(levelname)s: %(client_addr)s - %(request_line)s %(status_code)s"
+        }
+      },
+      "handlers": {
+        "default": {
+          "class": "logging.StreamHandler",
+          "formatter": "default",
+          "stream": "ext://sys.stdout"
+        },
+        "access": {
+          "class": "logging.StreamHandler",
+          "formatter": "access",
+          "stream": "ext://sys.stdout"
+        }
+      },
+      "loggers": {
+        "uvicorn": {
+          "handlers": ["default"],
+          "level": "INFO",
+          "propagate": false
+        },
+        "uvicorn.error": {
+          "level": "INFO"
+        },
+        "uvicorn.access": {
+          "handlers": ["access"],
+          "level": "INFO",
+          "propagate": false
+        }
+      },
+      "root": {
+        "handlers": ["default"],
+        "level": "INFO"
+      }
+    }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -35,6 +88,21 @@ spec:
         - name: app
           image: __IMAGE_REFERENCE__
           imagePullPolicy: IfNotPresent
+          command:
+            - uvicorn
+          args:
+            - app.main:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            - --workers
+            - "1"
+            - --log-level
+            - info
+            - --no-use-colors
+            - --log-config
+            - /etc/uvicorn/logging.json
           env:
             - name: DATABASE_URL
               valueFrom:
@@ -78,11 +146,20 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: logging
+              mountPath: /etc/uvicorn
+              readOnly: true
       volumes:
         - name: tmp
           emptyDir:
             medium: Memory
             sizeLimit: 64Mi
+        - name: logging
+          configMap:
+            name: __APP_NAME__
+            items:
+              - key: logging.json
+                path: logging.json
 ---
 apiVersion: v1
 kind: Service
