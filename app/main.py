@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 
 __all__ = ["Task", "TaskCreate", "TaskUpdate", "app", "create_app"]
@@ -56,6 +56,14 @@ def create_app() -> FastAPI:
         task = Task(id=task_id, **payload.model_dump())
         tasks[task_id] = task
         return task
+
+    @application.delete("/tasks/{task_id}", status_code=204)
+    def delete_task(task_id: int) -> Response:
+        if task_id not in tasks:
+            raise HTTPException(status_code=404)
+
+        del tasks[task_id]
+        return Response(status_code=204)
 
     return application
 
