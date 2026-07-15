@@ -1,3 +1,5 @@
+from collections.abc import Generator
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -5,8 +7,12 @@ from app.main import create_app
 
 
 @pytest.fixture
-def client() -> TestClient:
-    return TestClient(create_app())
+def client(
+    test_database_url: str,
+    clean_tasks: None,
+) -> Generator[TestClient, None, None]:
+    with TestClient(create_app(test_database_url)) as test_client:
+        yield test_client
 
 
 def test_health_is_public(client: TestClient) -> None:
@@ -39,7 +45,7 @@ def test_task_survives_application_instances(
     test_database_url: str,
     clean_tasks: None,
 ) -> None:
-    with TestClient(create_app()) as first_client:
+    with TestClient(create_app(test_database_url)) as first_client:
         created = first_client.post("/tasks", json={"title": "Write tutorial"})
 
     assert created.status_code == 201
@@ -49,7 +55,7 @@ def test_task_survives_application_instances(
         "completed": False,
     }
 
-    with TestClient(create_app()) as second_client:
+    with TestClient(create_app(test_database_url)) as second_client:
         response = second_client.get(f"/tasks/{created.json()['id']}")
 
     assert response.status_code == 200, response.json()
@@ -63,6 +69,28 @@ def test_list_tasks(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == [created.json()]
+
+
+def test_list_includes_tasks_from_another_application(
+    test_database_url: str,
+    clean_tasks: None,
+) -> None:
+    expected = {
+        "id": 1,
+        "title": "Write tutorial",
+        "completed": False,
+    }
+    with TestClient(create_app(test_database_url)) as first_client:
+        created = first_client.post("/tasks", json={"title": expected["title"]})
+
+    assert created.status_code == 201
+    assert created.json() == expected
+
+    with TestClient(create_app(test_database_url)) as second_client:
+        response = second_client.get("/tasks")
+
+    assert response.status_code == 200
+    assert response.json() == [expected]
 
 
 def test_get_task(client: TestClient) -> None:
