@@ -22,3 +22,14 @@ def test_swagger_ui_is_public(client: TestClient) -> None:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     assert "Swagger UI" in response.text
+
+
+def test_create_task(client: TestClient) -> None:
+    response = client.post("/tasks", json={"title": "Write tutorial"})
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "id": 1,
+        "title": "Write tutorial",
+        "completed": False,
+    }
