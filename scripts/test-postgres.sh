@@ -128,7 +128,7 @@ evidence_append() {
 }
 
 finalize_evidence() {
-  [[ "$EVIDENCE_ENABLED" == true ]] || return
+  [[ "$EVIDENCE_ENABLED" == true ]] || return 0
 
   python - "$EVIDENCE_DIR" <<'PY'
 from pathlib import Path
@@ -781,7 +781,7 @@ capture_public_http_evidence() (
   local capture_log
   local capture_status
 
-  [[ "$EVIDENCE_ENABLED" == true ]] || return
+  [[ "$EVIDENCE_ENABLED" == true ]] || return 0
   capture_log="$(mktemp "/tmp/sealos-fastapi-http-evidence-${RUN_ID}.XXXXXX.log")"
   trap 'rm -f "$capture_log"' EXIT INT TERM HUP
   set +e
