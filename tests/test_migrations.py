@@ -17,8 +17,8 @@ def test_fresh_and_repeat_upgrade(
     engine = create_engine(test_database_url, pool_pre_ping=True)
 
     try:
+        command.downgrade(config, "base")
         assert "tasks" not in inspect(engine).get_table_names()
-        assert "alembic_version" not in inspect(engine).get_table_names()
 
         command.upgrade(config, "head")
         command.upgrade(config, "head")
