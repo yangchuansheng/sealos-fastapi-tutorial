@@ -36,6 +36,11 @@ def create_app(database_url: str | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        logger.info(
+            "event=service_start source_release=%s image_reference=%s",
+            os.environ.get("SOURCE_RELEASE", "unknown"),
+            os.environ.get("IMAGE_REFERENCE", "unknown"),
+        )
         try:
             yield
         finally:

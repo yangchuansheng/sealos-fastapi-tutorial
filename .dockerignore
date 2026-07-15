@@ -1,0 +1,15 @@
+.git
+.github
+.pytest_cache
+.python-version
+.venv
+**/__pycache__
+*.pyc
+*.pyo
+deploy
+evidence
+scripts
+tests
+README.md
+*.log
+*.state

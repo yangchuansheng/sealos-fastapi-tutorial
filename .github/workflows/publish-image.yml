@@ -1,0 +1,267 @@
+name: Publish immutable image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full lowercase source commit SHA to publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      target_sha: ${{ steps.target.outputs.target_sha }}
+    steps:
+      - name: Normalize source identity
+        id: target
+        env:
+          DISPATCH_SHA: ${{ inputs.source_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            push)
+              candidate="$PUSH_SHA"
+              ;;
+            workflow_dispatch)
+              candidate="$DISPATCH_SHA"
+              ;;
+            *)
+              echo "Unsupported event: $EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+          if [[ ! "$candidate" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "source_sha must be 40 lowercase hexadecimal characters" >&2
+            exit 1
+          fi
+          target_sha="$candidate"
+          echo "target_sha=$target_sha"
+          echo "target_sha=$target_sha" >>"$GITHUB_OUTPUT"
+
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.10-bookworm@sha256:4f736ae292687621d4dbe0d499ffd024a36bd2ee7d8ca6f2ccd4c800f047b394
+        env:
+          POSTGRES_DB: tasks
+          POSTGRES_PASSWORD: tasks
+          POSTGRES_USER: tasks
+        options: >-
+          --health-cmd "pg_isready -U tasks -d tasks"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+        ports:
+          - 5432:5432
+    steps:
+      - name: Check out target source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.target_sha }}
+      - name: Verify checked-out source
+        env:
+          TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$TARGET_SHA"
+          echo "target_sha=$TARGET_SHA"
+      - name: Install locked Python toolchain
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          enable-cache: true
+          python-version: 3.12.13
+          version: 0.10.9
+      - name: Test source and PostgreSQL behavior
+        env:
+          DATABASE_URL: postgresql+psycopg://tasks:tasks@127.0.0.1:5432/tasks
+          TEST_DATABASE_URL: postgresql+psycopg://tasks:tasks@127.0.0.1:5432/tasks
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --locked
+          uv lock --check
+          uv export --locked --no-dev --no-emit-project --no-hashes \
+            --format requirements.txt --output-file requirements.txt
+          git diff --exit-code -- requirements.txt
+          uv run alembic upgrade head
+          uv run alembic upgrade head
+          uv run alembic current | grep -F '0001 (head)'
+          uv run pytest -q
+
+  publish:
+    needs:
+      - prepare
+      - test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-image-${{ needs.prepare.outputs.target_sha }}
+      cancel-in-progress: false
+    outputs:
+      image_digest: ${{ steps.result.outputs.image_digest }}
+    env:
+      IMAGE_TAG: ghcr.io/yangchuansheng/sealos-fastapi-tutorial:sha-${{ needs.prepare.outputs.target_sha }}
+      TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
+    steps:
+      - name: Check out target source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.target_sha }}
+      - name: Verify checked-out source metadata
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$TARGET_SHA"
+          source_date_epoch="$(git show -s --format=%ct "$TARGET_SHA")"
+          created="$(date -u --date="@$source_date_epoch" +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "source_date_epoch=$source_date_epoch" >>"$GITHUB_OUTPUT"
+          echo "created=$created" >>"$GITHUB_OUTPUT"
+          echo "target_sha=$TARGET_SHA"
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+      - name: Define immutable OCI metadata
+        id: metadata
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/yangchuansheng/sealos-fastapi-tutorial
+          flavor: latest=false
+          tags: |
+            type=raw,value=sha-${{ needs.prepare.outputs.target_sha }}
+          labels: |
+            org.opencontainers.image.title=Sealos FastAPI Tutorial
+            org.opencontainers.image.description=Tasks API reference application
+            org.opencontainers.image.url=https://github.com/yangchuansheng/sealos-fastapi-tutorial
+            org.opencontainers.image.source=https://github.com/yangchuansheng/sealos-fastapi-tutorial
+            org.opencontainers.image.version=sha-${{ needs.prepare.outputs.target_sha }}
+            org.opencontainers.image.created=${{ steps.source.outputs.created }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.target_sha }}
+          annotations: |
+            org.opencontainers.image.source=https://github.com/yangchuansheng/sealos-fastapi-tutorial
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.target_sha }}
+      - name: Build reproducible candidate
+        id: candidate
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          annotations: ${{ steps.metadata.outputs.annotations }}
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ steps.source.outputs.source_date_epoch }}
+            SOURCE_RELEASE=${{ needs.prepare.outputs.target_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          context: .
+          file: ./Dockerfile
+          labels: ${{ steps.metadata.outputs.labels }}
+          outputs: type=oci,dest=/tmp/candidate.tar
+          platforms: linux/amd64
+          provenance: false
+          pull: true
+          push: false
+          sbom: false
+          tags: ${{ steps.metadata.outputs.tags }}
+      - name: Accept only an absent or identical immutable tag
+        id: tag
+        env:
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ANON_DOCKER_CONFIG="$(mktemp -d)"
+          chmod 700 "$ANON_DOCKER_CONFIG"
+          test -z "$(find "$ANON_DOCKER_CONFIG" -mindepth 1 -print -quit)"
+          cleanup() {
+            rm -rf "$ANON_DOCKER_CONFIG"
+          }
+          trap cleanup EXIT
+
+          set +e
+          inspect_output="$(DOCKER_CONFIG="$ANON_DOCKER_CONFIG" \
+            docker buildx imagetools inspect "$IMAGE_TAG" 2>&1)"
+          inspect_status=$?
+          set -e
+
+          if [[ "$inspect_status" -eq 0 ]]; then
+            existing_digest="$(awk '$1 == "Digest:" {print $2; exit}' \
+              <<<"$inspect_output")"
+            test -n "$existing_digest"
+            test "$existing_digest" = "$CANDIDATE_DIGEST"
+            publish_needed=false
+          else
+            if ! grep -Eqi 'not found|manifest unknown|name unknown|unauthorized' \
+              <<<"$inspect_output"; then
+              echo "$inspect_output" >&2
+              exit "$inspect_status"
+            fi
+            existing_digest=""
+            publish_needed=true
+          fi
+
+          echo "candidate_digest=$CANDIDATE_DIGEST"
+          echo "existing_digest=$existing_digest" >>"$GITHUB_OUTPUT"
+          echo "publish_needed=$publish_needed" >>"$GITHUB_OUTPUT"
+          cleanup
+          trap - EXIT
+      - name: Log in to GHCR
+        if: steps.tag.outputs.publish_needed == 'true'
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4.4.0
+        with:
+          password: ${{ secrets.GITHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+      - name: Publish immutable image
+        if: steps.tag.outputs.publish_needed == 'true'
+        id: publish
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          annotations: ${{ steps.metadata.outputs.annotations }}
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ steps.source.outputs.source_date_epoch }}
+            SOURCE_RELEASE=${{ needs.prepare.outputs.target_sha }}
+          cache-from: type=gha
+          context: .
+          file: ./Dockerfile
+          labels: ${{ steps.metadata.outputs.labels }}
+          platforms: linux/amd64
+          provenance: false
+          pull: true
+          push: true
+          sbom: false
+          tags: ${{ steps.metadata.outputs.tags }}
+      - name: Record immutable output
+        id: result
+        env:
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.digest }}
+          PUBLISHED_DIGEST: ${{ steps.publish.outputs.digest }}
+          PUBLISH_NEEDED: ${{ steps.tag.outputs.publish_needed }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH_NEEDED" == "true" ]]; then
+            test "$PUBLISHED_DIGEST" = "$CANDIDATE_DIGEST"
+            IMAGE_DIGEST="$PUBLISHED_DIGEST"
+          else
+            IMAGE_DIGEST="$CANDIDATE_DIGEST"
+          fi
+          test "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$
+          echo "image_digest=$IMAGE_DIGEST" >>"$GITHUB_OUTPUT"
+          echo "target_sha=$TARGET_SHA image_digest=$IMAGE_DIGEST"
+          echo "target_sha=$TARGET_SHA image_digest=$IMAGE_DIGEST" \
+            >>"$GITHUB_STEP_SUMMARY"
