@@ -25,6 +25,11 @@ def create_app() -> FastAPI:
     tasks: dict[int, Task] = {}
     next_task_id = 1
 
+    def get_task_or_404(task_id: int) -> Task:
+        if task_id not in tasks:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return tasks[task_id]
+
     @application.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -44,14 +49,11 @@ def create_app() -> FastAPI:
 
     @application.get("/tasks/{task_id}", response_model=Task)
     def get_task(task_id: int) -> Task:
-        if task_id not in tasks:
-            raise HTTPException(status_code=404)
-        return tasks[task_id]
+        return get_task_or_404(task_id)
 
     @application.put("/tasks/{task_id}", response_model=Task)
     def update_task(task_id: int, payload: TaskUpdate) -> Task:
-        if task_id not in tasks:
-            raise HTTPException(status_code=404)
+        get_task_or_404(task_id)
 
         task = Task(id=task_id, **payload.model_dump())
         tasks[task_id] = task
@@ -59,8 +61,7 @@ def create_app() -> FastAPI:
 
     @application.delete("/tasks/{task_id}", status_code=204)
     def delete_task(task_id: int) -> Response:
-        if task_id not in tasks:
-            raise HTTPException(status_code=404)
+        get_task_or_404(task_id)
 
         del tasks[task_id]
         return Response(status_code=204)
