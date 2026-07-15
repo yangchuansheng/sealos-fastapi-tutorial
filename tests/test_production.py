@@ -1,5 +1,10 @@
 import logging
+import os
 import re
+import socket
+import subprocess
+import sys
+import time
 from pathlib import Path
 from textwrap import dedent
 
@@ -56,6 +61,59 @@ APPROVED_ACTIONS = {
 
 EXPECTED_APPLICATION_MANIFEST = dedent(
     """\
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: __APP_NAME__
+      labels:
+        app.kubernetes.io/name: __APP_NAME__
+        tutorial.sealos.io/run-id: __RUN_ID__
+    data:
+      logging.json: |
+        {
+          "version": 1,
+          "disable_existing_loggers": false,
+          "formatters": {
+            "default": {
+              "format": "%(levelname)s: %(message)s"
+            },
+            "access": {
+              "format": "%(levelname)s: %(client_addr)s - %(request_line)s %(status_code)s"
+            }
+          },
+          "handlers": {
+            "default": {
+              "class": "logging.StreamHandler",
+              "formatter": "default",
+              "stream": "ext://sys.stdout"
+            },
+            "access": {
+              "class": "logging.StreamHandler",
+              "formatter": "access",
+              "stream": "ext://sys.stdout"
+            }
+          },
+          "loggers": {
+            "uvicorn": {
+              "handlers": ["default"],
+              "level": "INFO",
+              "propagate": false
+            },
+            "uvicorn.error": {
+              "level": "INFO"
+            },
+            "uvicorn.access": {
+              "handlers": ["access"],
+              "level": "INFO",
+              "propagate": false
+            }
+          },
+          "root": {
+            "handlers": ["default"],
+            "level": "INFO"
+          }
+        }
+    ---
     apiVersion: apps/v1
     kind: Deployment
     metadata:
@@ -93,6 +151,21 @@ EXPECTED_APPLICATION_MANIFEST = dedent(
             - name: app
               image: __IMAGE_REFERENCE__
               imagePullPolicy: IfNotPresent
+              command:
+                - uvicorn
+              args:
+                - app.main:app
+                - --host
+                - 0.0.0.0
+                - --port
+                - "8000"
+                - --workers
+                - "1"
+                - --log-level
+                - info
+                - --no-use-colors
+                - --log-config
+                - /etc/uvicorn/logging.json
               env:
                 - name: DATABASE_URL
                   valueFrom:
@@ -136,11 +209,20 @@ EXPECTED_APPLICATION_MANIFEST = dedent(
               volumeMounts:
                 - name: tmp
                   mountPath: /tmp
+                - name: logging
+                  mountPath: /etc/uvicorn
+                  readOnly: true
           volumes:
             - name: tmp
               emptyDir:
                 medium: Memory
                 sizeLimit: 64Mi
+            - name: logging
+              configMap:
+                name: __APP_NAME__
+                items:
+                  - key: logging.json
+                    path: logging.json
     ---
     apiVersion: v1
     kind: Service
@@ -264,14 +346,14 @@ def test_startup_log_identifies_release(monkeypatch, caplog) -> None:
     monkeypatch.setenv("SOURCE_RELEASE", source_release)
     monkeypatch.setenv("IMAGE_REFERENCE", image_reference)
 
-    with caplog.at_level(logging.INFO, logger="app.main"):
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
         with TestClient(create_app()):
             pass
 
     release_records = [
         record
         for record in caplog.records
-        if record.name == "app.main"
+        if record.name == "uvicorn.error"
         and record.getMessage().startswith("event=service_start ")
     ]
     assert [record.getMessage() for record in release_records] == [
@@ -279,6 +361,67 @@ def test_startup_log_identifies_release(monkeypatch, caplog) -> None:
         f"source_release={source_release} "
         f"image_reference={image_reference}"
     ]
+
+
+def test_uvicorn_emits_startup_release_identity() -> None:
+    source_release = "a" * 40
+    image_reference = "ghcr.io/example/tasks@sha256:" + "b" * 64
+    environment = os.environ.copy()
+    environment.pop("DATABASE_URL", None)
+    environment["SOURCE_RELEASE"] = source_release
+    environment["IMAGE_REFERENCE"] = image_reference
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--workers",
+            "1",
+            "--log-level",
+            "info",
+            "--no-use-colors",
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    ready = False
+    try:
+        for _ in range(100):
+            if process.poll() is not None:
+                break
+            try:
+                with socket.create_connection(
+                    ("127.0.0.1", port),
+                    timeout=0.1,
+                ):
+                    ready = True
+                    break
+            except OSError:
+                time.sleep(0.05)
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        output, _ = process.communicate(timeout=5)
+
+    assert ready, output
+    assert (
+        "event=service_start "
+        f"source_release={source_release} "
+        f"image_reference={image_reference}"
+    ) in output
 
 
 def test_production_workload_contract() -> None:
@@ -362,6 +505,15 @@ def test_production_workload_contract() -> None:
     assert "kubectl rollout undo" in harness
     assert "baseline-rollback" in harness
     assert "final-recovered" in harness
+
+    assert 'assert container["command"] == ["uvicorn"]' in harness
+    assert 'assert container["args"] == [' in harness
+    assert 'assert container["volumeMounts"] == [' in harness
+    assert '"name": "logging"' in harness
+    assert '"configMap": {' in harness
+    assert '"name": app_name' in harness
+    assert '"key": "logging.json"' in harness
+    assert '"path": "logging.json"' in harness
 
     assert 'ANON_DOCKER_CONFIG="$(mktemp -d)"' in harness
     assert 'chmod 700 "$ANON_DOCKER_CONFIG"' in harness
